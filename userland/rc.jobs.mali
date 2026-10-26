@@ -1,0 +1,4 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# The Mali-G77: the panfrost interface (src/mali_test.c), then how fast Mesa panfrost fills a frame (src/gl_test.c).
+/redwood/bin/mali_test 50
+/redwood/bin/gl_test fill

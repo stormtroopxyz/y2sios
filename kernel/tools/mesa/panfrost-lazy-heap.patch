@@ -1,0 +1,140 @@
+diff -ru a/src/gallium/drivers/panfrost/pan_cmdstream.c b/src/gallium/drivers/panfrost/pan_cmdstream.c
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c	2026-10-25 15:15:45
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c	2026-10-25 15:16:04
+@@ -4153,8 +4153,8 @@
+       batch->tiler_ctx.midgard.disable = !has_draws;
+       batch->tiler_ctx.midgard.no_hierarchical_tiling =
+          dev->model->quirks.no_hierarchical_tiling;
+-      batch->tiler_ctx.midgard.heap.start = dev->tiler_heap->ptr.gpu;
+-      batch->tiler_ctx.midgard.heap.size = panfrost_bo_size(dev->tiler_heap);
++      batch->tiler_ctx.midgard.heap.start = panfrost_device_tiler_heap(dev)->ptr.gpu;
++      batch->tiler_ctx.midgard.heap.size = panfrost_bo_size(panfrost_device_tiler_heap(dev));
+    }
+ 
+    return batch->tiler_ctx.midgard.polygon_list;
+diff -ru a/src/gallium/drivers/panfrost/pan_device.c b/src/gallium/drivers/panfrost/pan_device.c
+--- a/src/gallium/drivers/panfrost/pan_device.c	2026-10-25 15:15:45
++++ b/src/gallium/drivers/panfrost/pan_device.c	2026-10-25 15:16:12
+@@ -30,7 +30,10 @@
+ #include "util/hash_table.h"
+ #include "util/macros.h"
+ #include "util/u_math.h"
++#include "util/log.h"
++#include "util/u_atomic.h"
+ #include "util/u_thread.h"
++#include <stdlib.h>
+ #include "pan_bo.h"
+ #include "pan_device.h"
+ #include "pan_encoder.h"
+@@ -117,13 +120,7 @@
+     * heap BO in that case.
+     */
+ 
+-   if (dev->arch < 10) {
+-      dev->tiler_heap = panfrost_bo_create(
+-         dev, 128 * 1024 * 1024, PAN_BO_INVISIBLE | PAN_BO_GROWABLE, "Tiler heap");
+-      if (!dev->tiler_heap)
+-         goto err_free_kmod_dev;
+-   }
+-
++   pthread_mutex_init(&dev->tiler_heap_lock, NULL);
+    pthread_mutex_init(&dev->submit_lock, NULL);
+ 
+    /* Done once on init */
+@@ -150,6 +147,34 @@
+    return -1;
+ }
+ 
++/* Redwood: the tiler heap, made at first use. PAN_TILER_HEAP_MB sets its size
++ * (default 32 MB; upstream's is 128 MB, grown on demand by the kernel). */
++struct panfrost_bo *
++panfrost_device_tiler_heap(struct panfrost_device *dev)
++{
++   struct panfrost_bo *heap = p_atomic_read(&dev->tiler_heap);
++
++   if (heap)
++      return heap;
++
++   pthread_mutex_lock(&dev->tiler_heap_lock);
++   if (!dev->tiler_heap) {
++      const char *env = getenv("PAN_TILER_HEAP_MB");
++      unsigned mb = env ? atoi(env) : 32;
++
++      if (mb < 4 || mb > 128)
++         mb = 32;
++      heap = panfrost_bo_create(dev, (size_t)mb * 1024 * 1024,
++                                PAN_BO_INVISIBLE | PAN_BO_GROWABLE, "Tiler heap");
++      if (!heap)
++         mesa_loge("panfrost: no memory for a %u MB tiler heap", mb);
++      p_atomic_set(&dev->tiler_heap, heap);
++   }
++   heap = dev->tiler_heap;
++   pthread_mutex_unlock(&dev->tiler_heap_lock);
++   return heap;
++}
++
+ void
+ panfrost_close_device(struct panfrost_device *dev)
+ {
+@@ -158,6 +183,7 @@
+     */
+    if (dev->model) {
+       pthread_mutex_destroy(&dev->submit_lock);
++      pthread_mutex_destroy(&dev->tiler_heap_lock);
+       panfrost_bo_unreference(dev->tiler_heap);
+       panfrost_bo_unreference(dev->sample_positions);
+       panfrost_bo_cache_evict_all(dev);
+diff -ru a/src/gallium/drivers/panfrost/pan_device.h b/src/gallium/drivers/panfrost/pan_device.h
+--- a/src/gallium/drivers/panfrost/pan_device.h	2026-10-25 15:15:45
++++ b/src/gallium/drivers/panfrost/pan_device.h	2026-10-25 15:16:04
+@@ -160,7 +160,11 @@
+     * simultaneously; by keeping on the device struct, we eliminate a
+     * costly per-context allocation. */
+ 
++   /* Redwood: created by panfrost_device_tiler_heap() at the first tiler job,
++    * not when the device opens. The kernel backs a heap fully when it is made
++    * (no grow-on-fault), and many processes open a device and never draw. */
+    struct panfrost_bo *tiler_heap;
++   pthread_mutex_t tiler_heap_lock;
+ 
+    /* The tiler heap is shared by all contexts, and is written by tiler
+     * jobs and read by fragment job. We need to ensure that a
+@@ -210,6 +214,8 @@
+ int panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev);
+ 
+ void panfrost_close_device(struct panfrost_device *dev);
++
++struct panfrost_bo *panfrost_device_tiler_heap(struct panfrost_device *dev);
+ 
+ bool panfrost_supports_compressed_format(struct panfrost_device *dev,
+                                          unsigned texfeat_bit);
+diff -ru a/src/gallium/drivers/panfrost/pan_jm.c b/src/gallium/drivers/panfrost/pan_jm.c
+--- a/src/gallium/drivers/panfrost/pan_jm.c	2026-10-25 15:15:45
++++ b/src/gallium/drivers/panfrost/pan_jm.c	2026-10-25 15:16:04
+@@ -164,7 +164,7 @@
+     */
+    if (batch->jm.jobs.vtc_jc.first_tiler)
+       bo_handles[submit.bo_handle_count++] =
+-         panfrost_bo_handle(dev->tiler_heap);
++         panfrost_bo_handle(panfrost_device_tiler_heap(dev));
+ 
+    /* Always used on Bifrost, occassionally used on Midgard */
+    bo_handles[submit.bo_handle_count++] =
+@@ -446,12 +446,13 @@
+       return tiler_desc;
+ 
+    struct panfrost_ptr t = pan_pool_alloc_desc(&batch->pool.base, TILER_HEAP);
++   struct panfrost_bo *tiler_heap = panfrost_device_tiler_heap(dev);
+ 
+    pan_cast_and_pack(t.cpu, TILER_HEAP, heap) {
+-      heap.size = panfrost_bo_size(dev->tiler_heap);
+-      heap.base = dev->tiler_heap->ptr.gpu;
+-      heap.bottom = dev->tiler_heap->ptr.gpu;
+-      heap.top = dev->tiler_heap->ptr.gpu + panfrost_bo_size(dev->tiler_heap);
++      heap.size = panfrost_bo_size(tiler_heap);
++      heap.base = tiler_heap->ptr.gpu;
++      heap.bottom = tiler_heap->ptr.gpu;
++      heap.top = tiler_heap->ptr.gpu + panfrost_bo_size(tiler_heap);
+    }
+ 
+    uint64_t heap = t.gpu;

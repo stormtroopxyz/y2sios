@@ -1,0 +1,4 @@
+# Commands run by the launchd job com.redwood.demo (RC_JOBS=rc.jobs.manual): nothing scripted -- the phone is
+# the user's to use; the kernel's and the Metal driver's 5 s lines (perf:, fb:, mali:, dvfs:, governor:) are the
+# measurement. grep -a -E 'perf: 5 s|^fb: [0-9]+ frames|^mali: 50|dvfs:|governor:' xnulog.txt
+/redwood/bin/hello_dyn ==== MANUAL RUN: use the phone as you like; when done, hold Vol-Down + Power for 3 s and go to Download Mode ====

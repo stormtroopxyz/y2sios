@@ -1,0 +1,29 @@
+# Commands run by the launchd job com.redwood.demo (RC_JOBS=rc.jobs.metaldiag), with RC=rc.launchd.metal,
+# QUIET=1 and boot-args "metal=1 camtl=1 metal_profile=1 mediamtl=1 fb_te=1 fb_bl=1" (PLANS/05-metal.md).
+#
+# The Metal diagnostic run, about three and a half minutes. At each screen the window server's Metal
+# driver is asked for a picture of the next frame (com.redwood.metal.snap; tools/metal-snaps.py turns
+# the log's lines into PNGs), and before the gestures that redraw Settings and Control Centre it is
+# asked to write out the next colour fills and image draws in full (com.redwood.metal.dump): vertex
+# layout, vertex bytes, matrix, and one pixel inside the shape before and after. Every Metal process
+# then prints its summary (com.redwood.metal.summary), the banner says the run is over, and the lock
+# button turns the screen off -- the sign, on the phone, that the log is complete.
+# grep -a -E '^redwoodmetal|==== METAL' xnulog.txt
+/redwood/bin/metal_props show
+/redwood/bin/hello_dyn ==== METAL RUN: started. Hands off the screen: a scripted tour starts in 60 s and the screen turns off by itself when everything is finished ====
+/redwood/bin/rwtouch wait 60
+/redwood/bin/hello_dyn ==== METAL RUN: step 1/5: unlock, home screen (snap 1) ====
+/redwood/bin/rwtouch swipe 0.5 0.985 0.5 0.3 200 wait 8 notify com.redwood.metal.snap wait 4
+/redwood/bin/hello_dyn ==== METAL RUN: step 2/5: Settings opened (snap 2) ====
+/redwood/bin/rwtouch tap 0.615 0.71 wait 12 notify com.redwood.metal.snap wait 4
+/redwood/bin/hello_dyn ==== METAL RUN: step 3/5: Settings scrolled, draws written out (dump, snap 3) ====
+/redwood/bin/rwtouch notify com.redwood.metal.dump wait 1 swipe 0.5 0.75 0.5 0.35 300 wait 5 notify com.redwood.metal.snap wait 4 button home wait 5
+/redwood/bin/hello_dyn ==== METAL RUN: step 4/5: Control Centre, draws written out (dump, snap 4) ====
+/redwood/bin/rwtouch notify com.redwood.metal.dump wait 1 swipe 0.9 0.005 0.9 0.6 300 wait 6 notify com.redwood.metal.snap wait 4 button home wait 4
+/redwood/bin/hello_dyn ==== METAL RUN: step 5/5: lock screen (snap 5) ====
+/redwood/bin/rwtouch button lock wait 3 button home wait 4 notify com.redwood.metal.snap wait 4
+/redwood/bin/hello_dyn ==== METAL RUN: tour done; asking every Metal process for its summary ====
+/redwood/bin/rwtouch notify com.redwood.metal.summary wait 5
+/redwood/bin/hello_dyn ==== METAL RUN: ALL TESTS FINISHED ====
+/redwood/bin/hello_dyn ==== METAL RUN: LOGS ARE READY TO BE SENT: the screen now turns off; hold Vol-Down + Power for 3 s, then Download Mode ====
+/redwood/bin/rwtouch button lock

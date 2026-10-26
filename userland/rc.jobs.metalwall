@@ -1,0 +1,9 @@
+# Commands run by the launchd job com.redwood.demo (RC_JOBS=rc.jobs.metalwall), with
+# RC=rc.launchd.metal and boot-args "metal=1 camtl=1 metal_profile=1 mediamtl=1".
+#
+# The wallpaper through Metal: the window server, PosterBoard and mediaserverd all find
+# RedwoodMetal by Metal's own discovery. This list only reports; the picture is the test.
+/redwood/bin/metal_props show
+/redwood/bin/hello_dyn y2s: metal boot up; waiting for SpringBoard and PosterBoard
+/redwood/bin/rwtouch wait 60
+/redwood/bin/hello_dyn y2s: 60 s in

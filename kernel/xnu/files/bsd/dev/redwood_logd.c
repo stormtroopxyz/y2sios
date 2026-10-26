@@ -1,0 +1,101 @@
+/*
+ * The kernel's logs for a reader while the system runs (PLANS/09-standalone.md, P4), so that a daemon
+ * (userland/src/rwlogd.c) can serve them over the network -- the same two the loader saves when the
+ * kernel returns (osfmk/arm64/loader_return.c):
+ *
+ *   sysctl kern.redwood_log           the console's log so far, oldest first (at most ~6.5 MB), root only
+ *   sysctl kern.redwood_log_total     characters ever written to it (a reader keeps its place with it)
+ *   sysctl kern.redwood_dmesg         the kernel's message buffer, oldest first (every printf), root only
+ *   sysctl kern.redwood_dmesg_total   characters ever written to that
+ */
+#include <kern/kalloc.h>
+#include <libkern/libkern.h>
+#include <sys/errno.h>
+#include <sys/kauth.h>
+#include <sys/msgbuf.h>
+#include <sys/proc.h>
+#include <sys/sysctl.h>
+#include <sys/systm.h>
+
+extern uint64_t loader_log_total;
+extern size_t loader_log_snapshot(char *out, size_t cap);
+extern uint64_t redwood_msgbuf_total;
+extern struct msgbuf *msgbufp;
+extern void bsd_log_lock_safe(void);
+extern void bsd_log_unlock(void);
+
+#define REDWOOD_LOG_MAX (6656 * 1024)
+
+static int
+redwood_log_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	char *copy;
+	size_t n;
+	int error;
+
+	if (req->oldptr == USER_ADDR_NULL) {
+		return SYSCTL_OUT(req, NULL, REDWOOD_LOG_MAX);
+	}
+	if (!kauth_cred_issuser(kauth_cred_get())) {
+		return EPERM;
+	}
+	copy = kalloc_data(REDWOOD_LOG_MAX, Z_WAITOK);
+	if (copy == NULL) {
+		return ENOMEM;
+	}
+	n = loader_log_snapshot(copy, REDWOOD_LOG_MAX);
+	error = SYSCTL_OUT(req, copy, n);
+	kfree_data(copy, REDWOOD_LOG_MAX);
+	return error;
+}
+
+/* the message buffer, oldest first, with the total as it was at the copy (so the two agree) */
+static int
+redwood_dmesg_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	size_t size = msgbufp != NULL && msgbufp->msg_size > 0 ? (size_t)msgbufp->msg_size : 0, n = 0;
+	char *copy;
+	int error;
+
+	if (req->oldptr == USER_ADDR_NULL) {
+		return SYSCTL_OUT(req, NULL, size + sizeof(uint64_t));
+	}
+	if (!kauth_cred_issuser(kauth_cred_get())) {
+		return EPERM;
+	}
+	copy = kalloc_data(size + sizeof(uint64_t), Z_WAITOK);
+	if (copy == NULL) {
+		return ENOMEM;
+	}
+	bsd_log_lock_safe();
+	if (msgbufp->msg_size == (int)size && msgbufp->msg_bufx >= 0 && msgbufp->msg_bufx < (int)size) {
+		uint64_t total = redwood_msgbuf_total;
+
+		memcpy(copy, &total, sizeof(total));
+		for (int pass = 0; pass < 2; pass++) {
+			int from = pass == 0 ? msgbufp->msg_bufx : 0, to = pass == 0 ? (int)size : msgbufp->msg_bufx;
+
+			for (int i = from; i < to; i++) {
+				if (msgbufp->msg_bufc[i] != 0) {
+					copy[sizeof(uint64_t) + n++] = msgbufp->msg_bufc[i];
+				}
+			}
+		}
+	}
+	bsd_log_unlock();
+	/* the first 8 bytes: the total at the copy; then the text */
+	error = SYSCTL_OUT(req, copy, n + sizeof(uint64_t));
+	kfree_data(copy, size + sizeof(uint64_t));
+	return error;
+}
+
+SYSCTL_PROC(_kern, OID_AUTO, redwood_log, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
+    redwood_log_sysctl, "A", "the kernel's console log, as the loader saves it");
+SYSCTL_QUAD(_kern, OID_AUTO, redwood_log_total, CTLFLAG_RD | CTLFLAG_LOCKED, &loader_log_total,
+    "characters ever written to the kernel's console log");
+SYSCTL_PROC(_kern, OID_AUTO, redwood_dmesg, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
+    redwood_dmesg_sysctl, "A", "the kernel's message buffer: 8 bytes of total, then the text oldest first");
+SYSCTL_QUAD(_kern, OID_AUTO, redwood_dmesg_total, CTLFLAG_RD | CTLFLAG_LOCKED, &redwood_msgbuf_total,
+    "characters ever written to the kernel's message buffer");

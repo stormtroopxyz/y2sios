@@ -1,0 +1,59 @@
+--- a/src/gallium/drivers/panfrost/pan_bo.c
++++ b/src/gallium/drivers/panfrost/pan_bo.c
+@@ -121,12 +121,21 @@
+    return NULL;
+ }
+ 
++#ifdef __APPLE__
++static void panfrost_bo_munmap(struct panfrost_bo *bo);
++#endif
++
+ static void
+ panfrost_bo_free(struct panfrost_bo *bo)
+ {
+    struct pan_kmod_bo *kmod_bo = bo->kmod_bo;
+    struct pan_kmod_vm *vm = bo->dev->kmod.vm;
+    uint64_t gpu_va = bo->ptr.gpu;
++
++#ifdef __APPLE__
++   /* (Darwin on redwood: a cached BO keeps its mapping, see panfrost_bo_unreference) */
++   panfrost_bo_munmap(bo);
++#endif
+ 
+    /* BO will be freed with the sparse array, but zero to indicate free */
+    memset(bo, 0, sizeof(*bo));
+@@ -232,7 +241,12 @@
+       list_del(&entry->bucket_link);
+       list_del(&entry->lru_link);
+ 
++#ifdef __APPLE__
++      /* (the kernel's MADVISE retains everything: one IOKit round trip a reuse saved) */
++      if (false) {
++#else
+       if (!pan_kmod_bo_make_unevictable(entry->kmod_bo)) {
++#endif
+          panfrost_bo_free(entry);
+          continue;
+       }
+@@ -288,7 +302,9 @@
+    struct list_head *bucket = pan_bucket(dev, MAX2(panfrost_bo_size(bo), 4096));
+    struct timespec time;
+ 
++#ifndef __APPLE__
+    pan_kmod_bo_make_evictable(bo->kmod_bo);
++#endif
+ 
+    /* Add us to the bucket */
+    list_addtail(&bo->bucket_link, bucket);
+@@ -463,7 +479,11 @@
+     */
+    if (p_atomic_read(&bo->refcnt) == 0) {
+       /* When the reference count goes to zero, we need to cleanup */
++#ifndef __APPLE__
+       panfrost_bo_munmap(bo);
++#endif
++      /* (Darwin on redwood: the CPU mapping stays with a cached BO -- an IOKit map and unmap
++       * per reuse were ~12% of the window server's time -- and goes in panfrost_bo_free) */
+ 
+       if (dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC))
+          pandecode_inject_free(dev->decode_ctx, bo->ptr.gpu,

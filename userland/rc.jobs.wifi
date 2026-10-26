@@ -1,0 +1,14 @@
+# Commands run by the launchd job com.redwood.demo (RC_JOBS=rc.jobs.wifi), boot-arg wifi_pcie=4 (PLANS/06-wireless.md,
+# W6): the BCM4375 is en0 and the station iOS's Wi-Fi side asks. A network is joined -- the one of fw-wifi/network
+# by the kernel, or one picked in Settings > Wi-Fi -- then configd's DHCP (asked for here if there is no IPv4
+# address 30 s after the join), a name resolved, a page fetched over plain TCP and over HTTPS.
+# grep -a -E 'WIFI RUN|^wifi:|net_test' xnulog.txt
+/redwood/bin/hello_dyn ==== WIFI RUN: started. Join a network in Settings > Wi-Fi within 3 minutes (unless fw/network was given) ====
+/redwood/bin/net_test store Setup:/Network/Service/.*/Interface
+/redwood/bin/net_test waitlink en0 180 waitaddr en0 30 show store State:/Network/Interface/en0/.*
+/redwood/bin/hello_dyn ==== WIFI RUN: DHCP asked for on en0 (nothing if configd has it already) ====
+/redwood/bin/net_test dhcp en0 waitaddr en0 60 show store State:/Network/Global/IPv4
+/redwood/bin/net_test resolve example.com tcp example.com 80 reach example.com
+/redwood/bin/net_test fetch https://example.com/ fetch https://www.apple.com/library/test/success.html
+/redwood/bin/hello_dyn ==== WIFI RUN: ALL TESTS FINISHED ====
+/redwood/bin/hello_dyn ==== WIFI RUN: LOGS ARE READY TO BE SENT: use the phone as you like, then hold Vol-Down + Power for 3 s and go to Download Mode ====

@@ -1,0 +1,62 @@
+Build the AIR (Metal) programs against panfrost, for the Exynos 990 phone's Mali-G77.
+
+air-ir3.patch and air-metal.patch declare air_run, libredwoodair and air_metal_test in
+freedreno's directory, which a DRIVERS=softpipe,panfrost build never reads. These are the
+same three, here, where driver_panfrost exists: the screen they open is chosen in their
+sources by GALLIUM_PANFROST (tools/mesa/air/air_metal.c, air_run.c). The libdrm stand-in
+(src/redwood-drm) is compiled into each, as tools/mesa/panfrost-darwin.patch does for
+libOSMesa, because freedreno's drm layer, which carries it otherwise, is not built.
+
+--- a/src/gallium/drivers/panfrost/meson.build
++++ b/src/gallium/drivers/panfrost/meson.build
+@@ -84,3 +84,50 @@
+   compile_args : compile_args_panfrost,
+   link_with : [libpanfrost, libpanfrostwinsys, libpanfrost_shared, libpanfrost_midgard, libpanfrost_bifrost, libpanfrost_decode, libpanfrost_lib],
+ )
++
++# The AIR frontend's consumers, on the Mali (Darwin on redwood): see air-ir3.patch and
++# air-metal.patch for what each is; only the driver differs.
++air_panfrost_drm = []
++if host_machine.system() == 'darwin' and not with_gallium_freedreno
++  air_panfrost_drm = files('../../../redwood-drm/redwood_drm.c')
++endif
++air_panfrost_includes = [inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium,
++                         inc_gallium_aux, inc_gallium_winsys_sw, inc_gallium_winsys,
++                         include_directories('../../drivers')]
++air_panfrost_deps = [dep_m, idep_air, idep_mesautil, idep_xmlconfig, driver_softpipe,
++                     driver_panfrost, dep_libdrm]
++
++air_run = executable(
++  'air_run',
++  [files('../../../compiler/air/air_run.c'), air_panfrost_drm],
++  include_directories : air_panfrost_includes,
++  dependencies : air_panfrost_deps,
++  link_with : [libgallium, libgalliumvl_stub, libws_null],
++  build_by_default : false,
++  install : false,
++)
++
++redwoodair_link_args = []
++if host_machine.system() == 'darwin'
++  redwoodair_link_args += '-Wl,-install_name,/redwood/lib/libredwoodair.dylib'
++endif
++
++libredwoodair = shared_library(
++  'redwoodair',
++  [files('../../../compiler/air/air_metal.c'), air_panfrost_drm],
++  include_directories : air_panfrost_includes,
++  dependencies : air_panfrost_deps,
++  link_with : [libgallium, libgalliumvl_stub, libws_null],
++  link_args : redwoodair_link_args,
++  build_by_default : false,
++  install : false,
++)
++
++air_metal_test = executable(
++  'air_metal_test',
++  files('../../../compiler/air/air_metal_test.c'),
++  include_directories : include_directories('../../../compiler/air'),
++  link_with : [libredwoodair],
++  build_by_default : false,
++  install : false,
++)

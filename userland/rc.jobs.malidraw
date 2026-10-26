@@ -1,0 +1,19 @@
+# Commands run by the launchd job com.redwood.demo (RC_JOBS=rc.jobs.malidraw, QUIET=1).
+#
+# Metal RENDERING on the Mali, alone. The boot of 24 October 21:00 (metal=1 camtl=1) put the
+# window server on Metal and every one of its frames timed out ("the GPU did not finish the draw
+# within two seconds"), with the first failure lost in the middle of the log. Compute had been
+# measured (air_run, 11/11 AV1SW); a draw never had. So: the desktop stays on OpenGL ES (no
+# metal=1, no camtl=1), and these draw through RedwoodMetal by MTLAddDevice, one step at a time,
+# with launchd quiet so the kernel's "mali: job ... faulted" lines stay in the log.
+# 25 Oct: with nir_shader_gather_info the draws make fragments, but a full quad covers pixel (0,0) of
+# 4x4 only, and the generated-vertex clears write nothing. Panfrost's own decoder says what the GPU
+# was handed (primitive, viewport, the position buffer); the compiler's dump says what the shaders do.
+/redwood/bin/rwtouch wait 20
+/redwood/bin/hello_dyn malidraw: 1 plain draw, traced
+/redwood/bin/metal_drv_test --env PAN_MESA_DEBUG=trace,sync --env PANDECODE_DUMP_FILE=stderr --env BIFROST_MESA_DEBUG=shaders --draw /System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib
+/redwood/bin/hello_dyn malidraw: 2 CoreAnimation vertex shader + GL fragment
+/redwood/bin/metal_drv_test --env BIFROST_MESA_DEBUG=shaders --draw-attrib --vertexlib /System/Library/Frameworks/QuartzCore.framework/default.metallib --vertex std_vert0_lpf --gated fixed_vert_lpf_spc --fragment texturedFragment2DUInt /System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib
+/redwood/bin/hello_dyn malidraw: 3 forty fragment shaders
+/redwood/bin/metal_drv_test --draw-all 0 40 /System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib
+/redwood/bin/hello_dyn malidraw: done

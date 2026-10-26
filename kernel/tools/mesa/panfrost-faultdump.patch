@@ -1,0 +1,92 @@
+--- a/src/gallium/drivers/panfrost/pan_jm.c	2026-10-24 22:35:28
++++ b/src/gallium/drivers/panfrost/pan_jm.c	2026-10-24 22:45:48
+@@ -34,6 +34,12 @@
+ #include "pan_jm.h"
+ #include "pan_job.h"
+ 
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++int redwood_drm_counts(uint64_t counts[4]);  /* tools/mesa/redwood-drm: the kernel's job, fault, reset counts */
++
+ #if PAN_ARCH >= 10
+ #error "JM helpers are only used for gen < 10"
+ #endif
+@@ -188,9 +194,38 @@
+       if (dev->debug & PAN_DBG_DUMP)
+          pandecode_dump_mappings(dev->decode_ctx);
+ 
+-      /* Jobs won't be complete if blackhole rendering, that's ok */
+-      if (!ctx->is_noop && dev->debug & PAN_DBG_SYNC)
++      /* Redwood (the Exynos 990 port, PAN_MESA_DEBUG=sync PAN_REDWOOD_FAULTS=1): the kernel
++       * resets the GPU on a fault and leaves the job header as it was, so the fault is told by
++       * its counter instead; only a chain that faulted is decoded, with the chain submitted
++       * before it (a fragment job's draws are in the vertex/tiler chain), three times at most. */
++      static int redwood_faults = -1;
++      if (redwood_faults < 0)
++         redwood_faults = getenv("PAN_REDWOOD_FAULTS") != NULL;
++      if (redwood_faults && !ctx->is_noop) {
++         static uint64_t seen = UINT64_MAX, previous_jc;
++         static unsigned dumped;
++         uint64_t counts[4];
++
++         if (redwood_drm_counts(counts) == 0) {
++            /* counts[3] is the chain that last faulted: every process shares the one
++             * address space and the one counter, so only a process whose own chain it is
++             * decodes it */
++            if (seen != UINT64_MAX && counts[1] != seen && counts[3] == submit.jc && dumped < 3) {
++               dumped++;
++               fprintf(stderr, "panfrost: chain %#" PRIx64 " faulted (%" PRIu64 " faults in this boot); "
++                       "the chain before it, then it:\n", (uint64_t)submit.jc, counts[1]);
++               if (previous_jc)
++                  pandecode_jc(dev->decode_ctx, previous_jc, panfrost_device_gpu_id(dev));
++               pandecode_jc(dev->decode_ctx, submit.jc, panfrost_device_gpu_id(dev));
++               fflush(stderr);
++            }
++            seen = counts[1];
++         }
++         previous_jc = submit.jc;
++      } else if (!ctx->is_noop && dev->debug & PAN_DBG_SYNC) {
++         /* Jobs won't be complete if blackhole rendering, that's ok */
+          pandecode_abort_on_fault(dev->decode_ctx, submit.jc, panfrost_device_gpu_id(dev));
++      }
+    }
+ 
+    return 0;
+--- a/src/panfrost/lib/genxml/decode.c	2026-10-24 22:45:37
++++ b/src/panfrost/lib/genxml/decode.c	2026-10-24 22:45:48
+@@ -344,7 +344,11 @@
+    if (temp.dimension == MALI_TEXTURE_DIMENSION_CUBE)
+       plane_count *= 6;
+ 
+-   for (unsigned i = 0; i < plane_count; ++i)
++   /* A null texture (Panfrost's descriptor for an unbound slot) has no planes: say so rather
++    * than read address 0, which aborted the process being decoded (Redwood). */
++   if (!temp.surfaces)
++      pandecode_log(ctx, "(no planes: a null texture)\n");
++   for (unsigned i = 0; temp.surfaces && i < plane_count; ++i)
+       DUMP_ADDR(ctx, PLANE, temp.surfaces + i * pan_size(PLANE), "Plane %u:\n",
+                 i);
+ #else
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c	2026-10-25 00:06:52
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c	2026-10-25 00:07:04
+@@ -1501,9 +1501,16 @@
+          mapped_ubo = sysvals;
+       } else {
+          struct pipe_constant_buffer *cb = &buf->cb[src.ubo];
+-         assert(!cb->buffer && cb->user_buffer &&
+-                "only user buffers use this path");
+ 
++         /* Redwood (the Exynos 990 port's Metal): a pushed word outside what was bound reads
++          * 0 instead of the memory after it. Metal binds a constant buffer by an offset into a
++          * buffer and lets a shader declare more than is left; reading past the binding here
++          * read past the mapping, and the window server died in this memcpy (25 October).
++          * A bound real buffer (no user pointer) reads 0 the same way, rather than NULL. */
++         if (!cb->user_buffer || src.offset + 4 > cb->buffer_size) {
++            push_cpu[i] = 0;
++            continue;
++         }
+          mapped_ubo = cb->user_buffer + cb->buffer_offset;
+       }
+ 

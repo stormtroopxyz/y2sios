@@ -1,0 +1,53 @@
+# Commands run by the launchd job com.redwood.demo (RC_JOBS=rc.jobs.airmali).
+# Metal shaders on the Mali-G77 (PLANS/05-metal.md M1/M2): the corpus kernels of rc.jobs.airkernels and
+# the draw air_run makes, through panfrost instead of ir3. No probe canary: the kernel resets the GPU after a
+# job that does not finish (bsd/dev/redwood_mali.c), so one hang does not wedge the rest of the boot.
+/redwood/bin/mali_test 20
+/redwood/bin/air_run /System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib clearFragment01
+/redwood/bin/air_run /System/Library/VideoDecoders/AV1SW.metallib BlitLumaKernel_Uint
+/redwood/bin/air_run /System/Library/VideoDecoders/AV1SW.metallib BlitChromaKernel_Uint
+/redwood/bin/air_run /System/Library/VideoDecoders/AV1SW.metallib BlitLumaKernel_UintPacked
+/redwood/bin/air_run /System/Library/VideoDecoders/AV1SW.metallib BlitChromaKernel_UintPacked
+/redwood/bin/air_run /System/Library/VideoDecoders/AV1SW.metallib BlitLumaKernel_Unorm
+/redwood/bin/air_run /System/Library/VideoDecoders/AV1SW.metallib BlitChromaKernel_Unorm
+/redwood/bin/air_run /System/Library/VideoDecoders/AV1SW.metallib BlitKernel_Unorm
+/redwood/bin/air_run /System/Library/VideoDecoders/AV1SW.metallib FilmGrainLumaKernel_Uint
+/redwood/bin/air_run /System/Library/VideoDecoders/AV1SW.metallib FilmGrainChromaKernel_Uint
+/redwood/bin/air_run /System/Library/VideoDecoders/AV1SW.metallib FilmGrainLumaKernel_Unorm
+/redwood/bin/air_run /System/Library/VideoDecoders/AV1SW.metallib FilmGrainChromaKernel_Unorm
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_Clear
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_InitMinMax
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_MinMax
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_CalcCubeInputScaling
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_PopulateCube
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_DilateCubeLuma
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_DilateCubeChroma1
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_DilateCubeChroma2
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_ErodeCubeLuma
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_ErodeCubeChroma1
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_ErodeCubeChroma2
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_InitSpanTable
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_GenerateMask
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_ConnectSpans
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_PropagateParents
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_PropogateAssociations
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_ResolveAssociations
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_DrawSpans
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_DrawEye
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib fbs_bistochastize_init
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib fbs_bistochastize_final
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib fbs_pcg_init
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib fbs_pcg_iter1
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib fbs_pcg_iter2
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib fbs_pcg_iter3
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib fbs_slice
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib fbs_slice_trilinear
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib spillCorrectionPreProcess
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib spillCorrectionPostProcess
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib image_calcminmax0
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib image_calcminmax1
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib image_calcminmax2
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib confidence
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_AddSeedPoint
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib fbs_bistochastize_iter
+/redwood/bin/air_run /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_GenerateToothMask

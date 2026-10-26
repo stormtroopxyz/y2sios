@@ -1,0 +1,165 @@
+--- a/meson.build
++++ b/meson.build
+@@ -1716,7 +1716,7 @@
+   # dependencies (such as vk-runtime) linking to it
+   dep_libdrm = null_dep
+ endif
+-if host_machine.system() == 'darwin' and with_gallium_freedreno
++if host_machine.system() == 'darwin' and (with_gallium_freedreno or with_gallium_panfrost)
+   # No DRM on this system: freedreno's requests go to the kernel's driver through a stand-in
+   # for libdrm (src/redwood-drm, put there by Darwin on redwood's tools/mk-mesa.sh; its one
+   # source file is built with freedreno's drm layer, src/freedreno/drm).
+--- a/src/panfrost/lib/kmod/pan_kmod.h
++++ b/src/panfrost/lib/kmod/pan_kmod.h
+@@ -615,8 +615,18 @@
+    if (mmap_offset < 0)
+       return MAP_FAILED;
+ 
++#ifdef __APPLE__
++   /* (Darwin on redwood: a buffer is the user client's memory of the type that is its handle) */
++   (void)prot;
++   (void)flags;
++   (void)host_addr;
++   host_addr = redwood_drm_map(bo->dev->fd, bo->handle, bo->size);
++   if (host_addr != MAP_FAILED)
++      host_addr = (uint8_t *)host_addr + bo_offset;
++#else
+    host_addr = os_mmap(host_addr, size, prot, flags, bo->dev->fd,
+                        mmap_offset + bo_offset);
++#endif
+    if (host_addr == MAP_FAILED) {
+       mesa_loge("mmap(..., size=%zu, prot=%d, flags=0x%x) failed: %s",
+                 size, prot, flags, strerror(errno));
+--- a/src/panfrost/lib/kmod/pan_kmod.c
++++ b/src/panfrost/lib/kmod/pan_kmod.c
+@@ -176,7 +176,13 @@
+ 
+       p_atomic_inc(&bo->refcnt);
+    } else {
++#ifdef __APPLE__
++      /* (what comes in here is an IOSurface, and the "file descriptor" its ID: redwood-drm) */
++      struct redwood_drm_surface surface = { .surface = (uint32_t)fd };
++      size_t size = redwood_drm_surface(dev->fd, &surface) ? 0 : surface.size;
++#else
+       size_t size = lseek(fd, 0, SEEK_END);
++#endif
+       if (size == 0 || size == (size_t)-1) {
+          mesa_loge("invalid dmabuf size");
+          goto err_close_handle;
+--- a/src/gallium/drivers/panfrost/pan_bo.c
++++ b/src/gallium/drivers/panfrost/pan_bo.c
+@@ -355,10 +355,14 @@
+    if (!bo->ptr.cpu)
+       return;
+ 
++#ifdef __APPLE__
++   redwood_drm_unmap(panfrost_device_fd(bo->dev), pan_kmod_bo_handle(bo->kmod_bo), bo->ptr.cpu);
++#else
+    if (os_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {
+       mesa_loge("munmap failed: %s", strerror(errno));
+       abort();
+    }
++#endif
+ 
+    bo->ptr.cpu = NULL;
+ }
+--- a/src/panfrost/lib/pan_props.c
++++ b/src/panfrost/lib/pan_props.c
+@@ -65,6 +65,7 @@
+         MODEL(0x7211, 0, "G76",    "TNOx", HAS_ANISO,         16384, {}),
+         MODEL(0x7212, 0, "G52",    "TGOx", HAS_ANISO,         16384, {}),
+         MODEL(0x7402, 0, "G52 r1", "TGOx", HAS_ANISO,         16384, {}),
++        MODEL(0x9080, 0, "G77",    "TTRx", HAS_ANISO,         32768, {}),
+         MODEL(0x9091, 0, "G57",    "TNAx", HAS_ANISO,         16384, {}),
+         MODEL(0x9093, 0, "G57",    "TNAx", HAS_ANISO,         16384, {}),
+ 
+--- a/src/gallium/targets/osmesa/meson.build
++++ b/src/gallium/targets/osmesa/meson.build
+@@ -22,9 +22,15 @@
+   command : gen_vs_module_defs_normal_command,
+ )
+ 
++osmesa_files = files('osmesa_target.c')
++if host_machine.system() == 'darwin' and with_gallium_panfrost and not with_gallium_freedreno
++  # (Darwin on redwood: the stand-in for libdrm, which freedreno's drm layer brings when it is built)
++  osmesa_files += files('../../../redwood-drm/redwood_drm.c')
++endif
++
+ libosmesa = shared_library(
+   osmesa_lib_name,
+-  'osmesa_target.c',
++  osmesa_files,
+   gnu_symbol_visibility : 'hidden',
+   link_args : [ld_args_gc_sections, osmesa_link_args],
+   vs_module_defs : osmesa_def,
+@@ -39,7 +45,7 @@
+   ],
+   dependencies : [
+     dep_ws2_32, dep_thread, dep_clock, dep_unwind, driver_swrast, idep_mesautil,
+-    driver_freedreno, idep_xmlconfig, dep_libdrm,
++    driver_freedreno, driver_panfrost, idep_xmlconfig, dep_libdrm,
+   ],
+   name_prefix : host_machine.system() == 'windows' ? '' : [],  # otherwise mingw will create libosmesa.dll
+   soversion : host_machine.system() == 'windows' ? '' : '8',
+--- a/src/gallium/targets/osmesa/osmesa_target.c
++++ b/src/gallium/targets/osmesa/osmesa_target.c
+@@ -65,6 +65,41 @@
+       gpu_fd = fd;
+    return screen ? debug_screen_wrap(screen) : NULL;
+ }
++#elif defined(GALLIUM_PANFROST)
++#include "panfrost/drm/panfrost_drm_public.h"
++#include "util/driconf.h"
++#include "util/xmlconfig.h"
++#include <xf86drm.h>
++
++static int gpu_fd = -1;
++
++static const driOptionDescription panfrost_options[] = {
++#include "panfrost/driinfo_panfrost.h"
++};
++
++/* The Mali's driver, where the kernel has the GPU (Darwin on redwood, RedwoodMali); NULL: none. */
++static struct pipe_screen *
++osmesa_create_gpu_screen(void)
++{
++   static driOptionCache info, cache;
++   static struct pipe_screen_config config;
++   struct pipe_screen *screen;
++   int fd;
++
++   if (debug_get_bool_option("OSMESA_SOFTWARE", false))
++      return NULL;
++   fd = drmOpenWithType("panfrost", NULL, DRM_NODE_RENDER);
++   if (fd < 0)
++      return NULL;
++   driParseOptionInfo(&info, panfrost_options, ARRAY_SIZE(panfrost_options));
++   driParseConfigFiles(&cache, &info, 0, "panfrost", NULL, NULL, NULL, 0, NULL, 0);
++   config.options = &cache;
++   config.options_info = &info;
++   screen = panfrost_drm_screen_create(fd, &config);
++   if (screen)
++      gpu_fd = fd;
++   return screen ? debug_screen_wrap(screen) : NULL;
++}
+ #endif
+ 
+ 
+@@ -79,7 +114,7 @@
+ struct pipe_resource *
+ osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface)
+ {
+-#ifdef GALLIUM_FREEDRENO
++#if defined(GALLIUM_FREEDRENO) || defined(GALLIUM_PANFROST)
+    struct redwood_drm_surface s = { .surface = surface };
+    struct pipe_resource templ = {
+       .target = PIPE_TEXTURE_2D,
+@@ -118,7 +153,7 @@
+    struct sw_winsys *winsys;
+    struct pipe_screen *screen;
+ 
+-#ifdef GALLIUM_FREEDRENO
++#if defined(GALLIUM_FREEDRENO) || defined(GALLIUM_PANFROST)
+    screen = osmesa_create_gpu_screen();
+    if (screen)
+       return screen;

@@ -1,0 +1,49 @@
+# Keep build output, downloaded sources, firmware and personal data out of git.
+
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.o
+*.obj
+*.efi
+*.dSYM/
+*.log
+
+# build trees and downloaded dependencies
+out/
+BUILD/
+xnu-src/
+xnu-deps/build/
+xnu-deps/host-macos/bin/xcrun
+ios165/
+prebuilt/
+Mu-Silicium/
+
+# images, RAM disks and partition backups
+*.img
+*.apfs
+*.dmg
+*.ipsw
+*.tar.md5
+*.lz4
+backup-y2s/
+fw-stock/
+fw-wifi/
+fw-audio/
+fw-gpu/
+fw-bt/
+fw-haptic/
+
+# Wi-Fi credentials and other local secrets
+network
+*.network
+*.secret
+.env
+
+# editor and OS files
+*~
+*.orig
+*.rej
+.idea/
+.vscode/

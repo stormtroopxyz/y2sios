@@ -1,0 +1,72 @@
+diff --git a/BootShim/BootShim.S b/BootShim/BootShim.S
+index 4d208553..3c3b17bb 100644
+--- a/BootShim/BootShim.S
++++ b/BootShim/BootShim.S
+@@ -28,6 +28,27 @@ _CopyLoop:
+   stp   x2, x3, [x5], #16
+   subs  x6, x6, #16
+   b.ne  _CopyLoop
++
++#ifdef PAYLOAD_BASE
++  /* x4 now points just past the FD: an optional "XNUP" payload may follow */
++  ldr   w2, [x4]
++  movz  w3, #0x4E58
++  movk  w3, #0x5055, lsl #16
++  cmp   w2, w3
++  b.ne  _NoPayload
++  ldr   w6, [x4, #4]    /* Payload Size */
++  add   x6, x6, #23     /* Header + Round Up to 16 */
++  and   x6, x6, #~15
++  movz  x5, #(PAYLOAD_BASE >> 16), lsl #16
++
++_PayloadLoop:
++  ldp   x2, x3, [x4], #16
++  stp   x2, x3, [x5], #16
++  subs  x6, x6, #16
++  b.ne  _PayloadLoop
++
++_NoPayload:
++#endif
+   ldr   x5, =FD_BASE
+ 
+ _Entry:
+diff --git a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c
+index 9b18ddb1..1953eda5 100644
+--- a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c
++++ b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c
+@@ -22,6 +22,7 @@
+ #include <Configuration/BootDevices.h>
+ 
+ #include "BootManager.h"
++#include "XnuLoader.h"
+ 
+ //
+ // Global Variables
+@@ -206,6 +207,9 @@ PlatformBootManagerUnableToBoot ()
+   // Execute Secondary Unable To Boot
+   DeviceBootManagerUnableToBoot ();
+ 
++  // HackiOS: hand over to the XNU loader payload (does not return if it starts).
++  XnuLoaderMain ();
++
+   // Display No Boot OS Logo
+   Status = DisplayBootGraphic (BG_NO_BOOT_OS);
+   if (EFI_ERROR (Status)) {
+diff --git a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf
+index 2310dc61..27709a65 100644
+--- a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf
++++ b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf
+@@ -14,6 +14,7 @@
+ 
+ [Sources]
+   BootManager.c
++  XnuLoader.c
+   KeyCallback.c
+ 
+ [Packages]
+@@ -48,3 +49,5 @@
+   gKeypadDeviceProtocolGuid
+   gEfiGraphicsOutputProtocolGuid
+   gEfiSimpleTextInputExProtocolGuid
++  gEfiBlockIoProtocolGuid
++  gEfiPartitionInfoProtocolGuid

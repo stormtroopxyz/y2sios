@@ -1,0 +1,3 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# The Galaxy S20+ (y2s) for everyday use: nothing -- no tests, no CPU load (rc.jobs runs cpu_test for 240 s).
+/redwood/bin/hello_dyn y2s: the system is up

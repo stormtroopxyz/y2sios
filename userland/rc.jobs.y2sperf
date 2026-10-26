@@ -1,0 +1,32 @@
+# Commands run by the launchd job com.redwood.demo (RC_JOBS=rc.jobs.y2sperf), with RC=rc.launchd.metal,
+# QUIET=1 and boot-args "metal=1 camtl=1 metal_profile=1 mediamtl=1 fb_te=1 fb_bl=1" (PLANS/05-metal.md).
+#
+# Where a Metal frame's time goes on the S20+, about four minutes, in labelled windows: the window
+# server's Metal driver says every 5 s how many command buffers it ran, how long -commit took and how
+# much of that was waiting for the GPU, and what compiling pipelines cost (`perf:` lines); the display
+# driver says how many frames reached the panel and what scaling them cost (`fb:` lines). Nothing else
+# is asked of the driver until the end: then Control Centre is traced draw by draw
+# (com.redwood.metal.trace: the glyphs that are still missing), two pictures are taken, and the run
+# reports and locks.
+# Windows 2-4 run under backboardd's sampling profiler (com.redwood.metal.prof: `prof:` lines, the
+# functions the window server's threads were in, with their callers).
+# grep -a -E 'METAL RUN|perf:|prof:|fb: [0-9]+ frames|fb: from one|fb_scaler' xnulog.txt
+/redwood/bin/metal_props show
+/redwood/bin/hello_dyn ==== METAL RUN: started. Hands off the screen: a scripted tour starts in 60 s and the screen turns off by itself when everything is finished ====
+/redwood/bin/rwtouch wait 60
+/redwood/bin/hello_dyn ==== METAL RUN: window 1/5: unlock, then the home screen left alone for 15 s ====
+/redwood/bin/rwtouch swipe 0.5 0.985 0.5 0.3 200 wait 15
+/redwood/bin/hello_dyn ==== METAL RUN: window 2/5: home screen pages swiped back and forth for 20 s (the profiler runs from here to the end of window 4) ====
+/redwood/bin/rwtouch notify com.redwood.metal.prof wait 1 swipe 0.9 0.5 0.1 0.5 300 wait 2 swipe 0.1 0.5 0.9 0.5 300 wait 2 swipe 0.9 0.5 0.1 0.5 300 wait 2 swipe 0.1 0.5 0.9 0.5 300 wait 2 swipe 0.9 0.5 0.1 0.5 300 wait 2 swipe 0.1 0.5 0.9 0.5 300 wait 2 swipe 0.9 0.5 0.1 0.5 300 wait 2 swipe 0.1 0.5 0.9 0.5 300 wait 4
+/redwood/bin/hello_dyn ==== METAL RUN: window 3/5: Settings opened (first time: pipelines compile), then scrolled for 15 s ====
+/redwood/bin/rwtouch tap 0.615 0.71 wait 10 swipe 0.5 0.75 0.5 0.35 300 wait 2 swipe 0.5 0.35 0.5 0.75 300 wait 2 swipe 0.5 0.75 0.5 0.35 300 wait 2 swipe 0.5 0.35 0.5 0.75 300 wait 2 button home wait 5
+/redwood/bin/hello_dyn ==== METAL RUN: window 4/5: Settings opened a second time (pipelines already compiled) ====
+/redwood/bin/rwtouch tap 0.615 0.71 wait 6 swipe 0.5 0.75 0.5 0.35 300 wait 2 swipe 0.5 0.35 0.5 0.75 300 wait 2 button home wait 5
+/redwood/bin/rwtouch notify com.redwood.metal.prof wait 3
+/redwood/bin/hello_dyn ==== METAL RUN: window 5/5: Control Centre, its shapes dumped and traced draw by draw, then two pictures ====
+/redwood/bin/rwtouch notify com.redwood.metal.dump wait 1 swipe 0.9 0.005 0.9 0.6 300 wait 5 notify com.redwood.metal.trace wait 3 notify com.redwood.metal.snap wait 5 button home wait 4 notify com.redwood.metal.snap wait 5
+/redwood/bin/hello_dyn ==== METAL RUN: tour done; asking every Metal process for its summary ====
+/redwood/bin/rwtouch notify com.redwood.metal.summary wait 5
+/redwood/bin/hello_dyn ==== METAL RUN: ALL TESTS FINISHED ====
+/redwood/bin/hello_dyn ==== METAL RUN: LOGS ARE READY TO BE SENT: the screen now turns off; hold Vol-Down + Power for 3 s, then Download Mode ====
+/redwood/bin/rwtouch button lock
