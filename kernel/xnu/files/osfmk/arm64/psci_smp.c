@@ -47,6 +47,8 @@
 #include <pexpert/device_tree.h>
 #include <pexpert/arm64/board_config.h>
 #include <vm/pmap.h>
+#include <kern/task.h>
+#include <kern/thread.h>
 
 #if defined(GENERIC_PSCI_SMP)
 
@@ -72,6 +74,7 @@ uint32_t psci_smp_hvc;
  * kernel is far above 4 GB. Cores are started one at a time, so one slot is enough.
  */
 static uint64_t psci_smp_trampoline;
+static uint64_t resume_data_pa;         /* (cpuidle, below) */
 static uint64_t psci_smp_slot_pa;
 static volatile uint64_t *psci_smp_slot;
 
@@ -424,6 +427,505 @@ psci_smp_stop_here(void)
 		loader_return();        /* stops the rest (psci_smp_stop_others()); back only if no loader listens */
 		for (;;) {
 			__builtin_arm_wfi();
+		}
+	}
+}
+
+
+/*
+ * ==== Idle power-down (boot-arg cpuidle=1) ====
+ *
+ * An idle core is powered off through the firmware (PSCI CPU_SUSPEND with the device tree's c2 state,
+ * arm,psci-suspend-param 0x10000) instead of waiting in WFI clocked and powered. What that needs, and where:
+ *  - a way back in: the firmware restarts the core at an address below 4 GB without its context, so the
+ *    loader's kernel_cpu_resume finds it by its MPIDR in a table this file fills (xnuloader/loader.c) and
+ *    enters the kernel's reset vector, where XNU's own non-retention path takes it (cpu_reset_handler is
+ *    resume_idle_cpu: start.s -> arm_init_idle_cpu -> redwood_cpuidle_resumed -> Idle_load_context);
+ *  - a way to be woken: the ARM timer is `use-clocksource-only` on this SoC (its comparator does not wake
+ *    a powered-off core), so the next deadline is set on the core's own MCT local timer (Samsung's
+ *    exynos_mct.c: L_n at 0x10040300 + 0x100 n, 26 MHz / 2, GIC SPI 0x1d6 + n) for the power-down only;
+ *  - what the core loses: the GIC's CPU interface (gic_v3_irq_cpu_resume), the timer's comparator
+ *    (timer_resync_deadlines), jit_flush's SCTLR bit (redwood_uci_off).
+ * Only when the next deadline is past the state's minimum residency (dtb: 2 ms A55, 1 ms A76 and M5).
+ * Armed cpuidle_after= seconds after boot (default 60). Counted in the 10 s dvfs: report.
+ */
+#define PSCI_CPU_SUSPEND        0xC4000001u
+#define PSCI_C2_POWER_DOWN      0x10000u
+#define MCT_PHYS                0x10040000ULL
+#define MCT_L(n)                (0x300u + 0x100u * (n))
+#define MCT_L_TCNTB             0x00u
+#define MCT_L_ICNTB             0x08u
+#define MCT_L_TCON              0x20u
+#define MCT_L_INT_CSTAT         0x30u
+#define MCT_L_INT_ENB           0x34u
+#define MCT_L_WSTAT             0x40u
+#define MCT_L_TCON_INT_START    (1u << 1)
+#define MCT_L_TCON_TIMER_START  (1u << 0)
+#define MCT_INTID(n)            (32u + 0x1d6u + (n))
+
+uint64_t redwood_cpu_mpidr[8];          /* each core's MPIDR | bit 63, at its first cpu_init (cpu.c) */
+static bool redwood_cpuidle_on;
+static volatile uint8_t *mct;
+static volatile uint64_t *resume_data;
+static uint64_t resume_tramp_pa;
+static uint64_t residency_abs[8], latency_abs[8];
+struct redwood_cpuidle_count {
+	uint64_t entered, resumed, returned, refused, skipped, slept_abs;
+};
+struct redwood_cpuidle_count redwood_cpuidle_counts[8];
+static uint64_t suspend_at[8];
+uint64_t redwood_cpuidle_resumed_at[8]; /* each core's last return from a power-down (mach time) */
+extern void gic_v3_irq_cpu_resume(void);
+extern kern_return_t gic_v3_spi_attach_to(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid),
+    void *context, int cpu);
+extern uint32_t gic_resume_seen[][2];
+
+/*
+ * The PMU's part (Samsung: cpuidle-exynos64.c -> exynos_cpu_pm_enter/exit -> cal_cpu_disable/enable, the
+ * sequences of cal-if/exynos9830/flexpmu_cal_cpu_exynos9830.h): without it the firmware's CPU_SUSPEND is a WFI
+ * with the core left powered. Before: the core's CPU_INFORM says C2 (pmucal_powermode_hint), its wake-up
+ * interrupt to the PMU is enabled (PMU_INTR_GEN GRP2_INTR_BID_ENABLE bit n), pending GRP1 bits n and n + 8
+ * cleared, and its power-down request interrupt enabled (CLUSTERc_CPUi_INT_EN bit 3). After: the reverse
+ * (core*_on). Under one lock, as Samsung's cpupm_lock: the GRP registers are shared.
+ */
+#define PMU_ALIVE_PHYS          0x15860000ULL
+#define PMU_INTR_GEN_PHYS       0x15870000ULL
+#define PMU_CPU_INFORM(n)       (0x0860u + 4u * (n))
+#define PMU_CPU_INFORM_C2       1u
+#define PMU_GRP1_PEND           0x0108u
+#define PMU_GRP1_CLEAR          0x010cu
+#define PMU_GRP2_ENABLE         0x0200u
+#define PMU_GRP2_PEND           0x0208u
+#define PMU_GRP2_CLEAR          0x020cu
+static volatile uint8_t *pmu_alive, *pmu_intr;
+static uint32_t pmu_lock;
+
+/* CLUSTERc_CPUi_INT_EN of core n in the dtb's order (0-3 cluster 0, 4-5 cluster 1, 6-7 cluster 2) */
+static uint32_t
+pmu_int_en(unsigned n)
+{
+	return n < 4 ? 0x1044u + 0x80u * n : n < 6 ? 0x1344u + 0x80u * (n - 4) : 0x1544u + 0x80u * (n - 6);
+}
+
+static uint32_t
+pmu_read(volatile uint8_t *base, uint32_t reg)
+{
+	return *(volatile uint32_t *)(base + reg);
+}
+
+static void
+pmu_write(volatile uint8_t *base, uint32_t reg, uint32_t value)
+{
+	*(volatile uint32_t *)(base + reg) = value;
+}
+
+static void
+pmu_core(unsigned n, bool off)
+{
+	while (!os_atomic_cmpxchg(&pmu_lock, 0, 1, acquire)) {
+		__builtin_arm_yield();
+	}
+	if (off) {
+		pmu_write(pmu_alive, PMU_CPU_INFORM(n), PMU_CPU_INFORM_C2);
+		pmu_write(pmu_intr, PMU_GRP2_ENABLE, pmu_read(pmu_intr, PMU_GRP2_ENABLE) | 1u << n);
+		pmu_write(pmu_intr, PMU_GRP1_CLEAR, pmu_read(pmu_intr, PMU_GRP1_PEND) & (1u << n));
+		pmu_write(pmu_intr, PMU_GRP1_CLEAR, pmu_read(pmu_intr, PMU_GRP1_PEND) & (1u << (n + 8)));
+		pmu_write(pmu_alive, pmu_int_en(n), pmu_read(pmu_alive, pmu_int_en(n)) | 1u << 3);
+	} else {
+		pmu_write(pmu_intr, PMU_GRP2_ENABLE, pmu_read(pmu_intr, PMU_GRP2_ENABLE) & ~(1u << n));
+		pmu_write(pmu_intr, PMU_GRP2_CLEAR, pmu_read(pmu_intr, PMU_GRP2_PEND) & (1u << n));
+		pmu_write(pmu_alive, pmu_int_en(n), pmu_read(pmu_alive, pmu_int_en(n)) & ~(1u << 3));
+	}
+	__builtin_arm_dsb(DSB_SY);
+	os_atomic_store(&pmu_lock, 0, release);
+}
+extern bool redwood_jit_flush_on;
+extern void redwood_uci_off(void *arg);
+extern void timer_resync_deadlines(void);
+
+static void
+mct_write(unsigned n, uint32_t reg, uint32_t value, uint32_t wstat)
+{
+	*(volatile uint32_t *)(mct + MCT_L(n) + reg) = value;
+	if (wstat != 0) {
+		for (unsigned spin = 0; spin < 100000; spin++) {
+			if (*(volatile uint32_t *)(mct + MCT_L(n) + MCT_L_WSTAT) & wstat) {
+				*(volatile uint32_t *)(mct + MCT_L(n) + MCT_L_WSTAT) = wstat;
+				break;
+			}
+		}
+	}
+}
+
+/* core n's local timer stopped and its interrupt cleared (exynos4_mct_tick_stop) */
+static void
+mct_stop(unsigned n)
+{
+	mct_write(n, MCT_L_INT_CSTAT, 1, 0);
+	mct_write(n, MCT_L_TCON, *(volatile uint32_t *)(mct + MCT_L(n) + MCT_L_TCON) &
+	    ~(MCT_L_TCON_INT_START | MCT_L_TCON_TIMER_START | (1u << 2)), 1u << 3);
+}
+
+/* ... to interrupt after `ticks` of 13 MHz (exynos4_mct_tick_start, one-shot) */
+static void
+mct_start(unsigned n, uint32_t ticks)
+{
+	mct_write(n, MCT_L_ICNTB, (1u << 31) | ticks, 1u << 1);
+	mct_write(n, MCT_L_INT_ENB, 1, 0);
+	mct_write(n, MCT_L_TCON, MCT_L_TCON_INT_START | MCT_L_TCON_TIMER_START, 1u << 3);
+}
+
+/* the wake-up itself: nothing to do but quiet it (the core's deadlines are the ARM timer's again) */
+static void
+mct_interrupt(void *context, uint32_t intid __unused)
+{
+	mct_stop((unsigned)(uintptr_t)context);
+}
+
+static void
+redwood_cpuidle_arm(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
+{
+	extern void m2m_klog(char sev, const char *cat, const char *fmt, ...);
+	uint64_t us;
+	unsigned cores = 0;
+
+	mct = (volatile uint8_t *)ml_io_map(MCT_PHYS, 0x1000);
+	pmu_alive = (volatile uint8_t *)ml_io_map(PMU_ALIVE_PHYS, 0x2000);
+	pmu_intr = (volatile uint8_t *)ml_io_map(PMU_INTR_GEN_PHYS, 0x1000);
+	if (pmu_alive == NULL || pmu_intr == NULL) {
+		m2m_klog('E', "DEV", "cpuidle: the PMU could not be mapped: not armed");
+		return;
+	}
+	resume_data = (volatile uint64_t *)(ml_io_map(trunc_page(resume_data_pa), PAGE_SIZE) + (resume_data_pa & PAGE_MASK));
+	if (mct == NULL || resume_data == NULL) {
+		m2m_klog('E', "DEV", "cpuidle: the MCT or the loader's resume table could not be mapped: not armed");
+		return;
+	}
+	{
+		int64_t version = psci_call(0x84000000u, 0, 0, 0);
+		int64_t features = psci_call(0x8400000Au, PSCI_CPU_SUSPEND, 0, 0);
+		uint32_t g_tcon = *(volatile uint32_t *)(mct + 0x240), cnt0 = *(volatile uint32_t *)(mct + 0x100), cnt1;
+
+		delay(100);
+		cnt1 = *(volatile uint32_t *)(mct + 0x100);
+		m2m_klog('I', "DEV", "cpuidle: PSCI version %lld.%lld, CPU_SUSPEND features %#llx (bit 1: extended state ids); "
+		    "MCT G_TCON %#x, its counter %u -> %u in 100 us", version >> 16, version & 0xffff, features, g_tcon,
+		    cnt0, cnt1);
+		if (features < 0 || (features & 2)) {
+			/* not there, or 0x10000 would mean something else in the extended format */
+			m2m_klog('E', "DEV", "cpuidle: CPU_SUSPEND not usable with the dtb's original-format state: not armed");
+			return;
+		}
+	}
+	resume_data[0] = ml_static_vtop((vm_offset_t)&LowResetVectorBase);
+	for (int cpu = 0; cpu <= ml_get_max_cpu_number() && cpu < 8; cpu++) {
+		cpu_data_t *cdp = cpu_datap(cpu);
+		uint64_t mpidr = redwood_cpu_mpidr[cpu];
+		bool small = cpu < 4;   /* the dtb's order: 0-3 Cortex-A55, 4-5 Cortex-A76, 6-7 M5 */
+
+		if (cdp == NULL || !(mpidr & (1ULL << 63))) {
+			continue;
+		}
+		resume_data[1 + 2 * cpu] = mpidr & 0xffffff;
+		resume_data[2 + 2 * cpu] = cdp->cpu_phys_id;
+		/* dtb idle-states: min-residency 2000/1000/1000 us; entry + exit 70+160, 150+190, 235+220 us */
+		nanoseconds_to_absolutetime((small ? 2000 : 1000) * NSEC_PER_USEC, &residency_abs[cpu]);
+		us = cpu < 4 ? 230 : cpu < 6 ? 340 : 455;
+		nanoseconds_to_absolutetime(us * NSEC_PER_USEC, &latency_abs[cpu]);
+		mct_write(cpu, MCT_L_TCNTB, 1, 1u << 0);         /* TICK_BASE_CNT: 26 MHz / 2 */
+		mct_stop(cpu);
+		m2m_klog('I', "DEV", "cpuidle: core %d: MPIDR %#llx, PMU status %#x, INT_EN %#x, CPU_INFORM %#x", cpu,
+		    mpidr & ~(1ULL << 63), pmu_read(pmu_alive, pmu_int_en(cpu) - 0x40), pmu_read(pmu_alive, pmu_int_en(cpu)),
+		    pmu_read(pmu_alive, PMU_CPU_INFORM(cpu)));
+		if (gic_v3_spi_attach_to(MCT_INTID(cpu), false, mct_interrupt, (void *)(uintptr_t)cpu, cpu) != KERN_SUCCESS) {
+			m2m_klog('E', "DEV", "cpuidle: core %d's MCT interrupt %u could not be attached: not armed", cpu,
+			    MCT_INTID(cpu));
+			return;
+		}
+		cores++;
+	}
+	__builtin_arm_dsb(DSB_SY);
+	os_atomic_store(&redwood_cpuidle_on, true, release);
+	m2m_klog('I', "DEV", "cpuidle: armed on %u cores: PSCI CPU_SUSPEND %#x through the loader's trampoline %#llx, "
+	    "woken by the MCT's local timers", cores, PSCI_C2_POWER_DOWN, resume_tramp_pa);
+}
+
+void redwood_cpuidle_init(void);
+void
+redwood_cpuidle_init(void)
+{
+	DTEntry chosen;
+	void const *prop;
+	unsigned int size;
+	uint32_t on = 0, after = 60;
+	uint64_t deadline;
+
+	if (!PE_parse_boot_argn("cpuidle", &on, sizeof(on)) || on != 1) {
+		return;
+	}
+	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
+	    SecureDTGetProperty(chosen, "psci-cpu-resume-trampoline", &prop, &size) != kSuccess || size != 8) {
+		return;         /* a loader without kernel_cpu_resume */
+	}
+	memcpy(&resume_tramp_pa, prop, 8);
+	if (SecureDTGetProperty(chosen, "psci-cpu-resume-data", &prop, &size) != kSuccess || size != 8) {
+		return;
+	}
+	memcpy(&resume_data_pa, prop, 8);
+	PE_parse_boot_argn("cpuidle_after", &after, sizeof(after));
+	clock_interval_to_deadline(after, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(thread_call_allocate(redwood_cpuidle_arm, NULL), deadline);
+}
+
+/*
+ * From cpu_idle() in place of WFI, interrupts masked: false when not worth it (WFI then); true when the
+ * firmware came back without powering the core off (an interrupt was already pending). When it does power
+ * off, this does not return: the core comes back through redwood_cpuidle_resumed().
+ */
+bool redwood_cpuidle_enter(void);
+bool
+redwood_cpuidle_enter(void)
+{
+	cpu_data_t *cdp = getCpuDatap();
+	int cpu = cpu_number();
+	uint64_t now, pop, left, ticks;
+	int64_t status;
+
+	if (!os_atomic_load(&redwood_cpuidle_on, acquire) || cpu >= 8 || latency_abs[cpu] == 0) {
+		return false;
+	}
+	now = mach_absolute_time();
+	pop = cdp->rtcPop;
+	left = pop > now ? pop - now : 0;
+	if (left < residency_abs[cpu]) {
+		redwood_cpuidle_counts[cpu].skipped++;
+		return false;
+	}
+	/* the MCT local timer counts 13 MHz (26 MHz oscillator / (TCNTB 1 + 1)); woken that much before the deadline */
+	absolutetime_to_nanoseconds(left - latency_abs[cpu], &ticks);
+	ticks = ticks / 1000 * 13;
+	mct_start((unsigned)cpu, (uint32_t)(ticks > 0x7fffffff ? 0x7fffffff : ticks));
+	redwood_cpuidle_counts[cpu].entered++;
+	suspend_at[cpu] = now;
+	pmu_core((unsigned)cpu, true);
+	status = psci_call(PSCI_CPU_SUSPEND, PSCI_C2_POWER_DOWN, resume_tramp_pa, 0);
+	/* back without a power-down */
+	pmu_core((unsigned)cpu, false);
+	mct_stop((unsigned)cpu);
+	if (status != 0) {
+		redwood_cpuidle_counts[cpu].refused++;
+		if (status == -1 || status == -2) {     /* not supported, invalid parameters: never again */
+			os_atomic_store(&redwood_cpuidle_on, false, release);
+		}
+	} else {
+		redwood_cpuidle_counts[cpu].returned++;
+	}
+	return true;
+}
+
+/* A core back from a power-down (arm_init_idle_cpu, interrupts masked): what it lost, then XNU's own path. */
+void redwood_cpuidle_resumed(void);
+void
+redwood_cpuidle_resumed(void)
+{
+	int cpu = cpu_number();
+
+	gic_v3_irq_cpu_resume();
+	if (redwood_jit_flush_on) {
+		redwood_uci_off(NULL);
+	}
+	if (cpu < 8 && mct != NULL) {
+		pmu_core((unsigned)cpu, false);
+		mct_stop((unsigned)cpu);
+		redwood_cpuidle_counts[cpu].resumed++;
+		redwood_cpuidle_resumed_at[cpu] = mach_absolute_time();
+		redwood_cpuidle_counts[cpu].slept_abs += mach_absolute_time() - suspend_at[cpu];
+	}
+	getCpuDatap()->rtcPop = EndOfAllTime;   /* the comparator is gone: whatever was set is set again */
+	timer_resync_deadlines();
+}
+
+/*
+ * What wakes the cores (with cpuidle armed): per core, its interrupts by kind and the timer callouts that
+ * fired on it, by function, and for a thread's own timeout (thread_timer_expire: a sleep, a wait with a
+ * deadline) by process and thread. Reported every 10 s from the dvfs: report (redwood_wake_report). Each
+ * core writes only its own table, from interrupt context; the reader takes the counts with an exchange.
+ */
+#define WAKE_SLOTS      24
+struct wake_slot {
+	uintptr_t key;                  /* the thread for thread_timer_expire, else the function */
+	uintptr_t func;
+	uint32_t count;
+	int pid;
+	char name[40];                  /* process / thread */
+	uint64_t frames[6];             /* an unnamed kernel thread's: where it waits (return addresses, unslid) */
+	bool told;
+};
+static struct wake_slot wake_timers[8][WAKE_SLOTS];
+static uint32_t wake_irqs[8][4];        /* timer PPI, SGI (another core), SPI (a device), other */
+static struct {
+	uint32_t intid, count;
+} wake_spis[8][6];
+extern void thread_timer_expire(void *p0, void *p1);
+extern vm_offset_t kernel_stack_size;
+extern char *proc_name_address(void *p);
+extern int proc_pid(void *p);
+extern void bsd_getthreadname(void *uth, char *buffer);
+
+void redwood_wake_irq(int cpu, uint32_t intid);
+void
+redwood_wake_irq(int cpu, uint32_t intid)
+{
+	if (!os_atomic_load(&redwood_cpuidle_on, relaxed) || cpu >= 8) {
+		return;
+	}
+	if (intid == 27) {
+		wake_irqs[cpu][0]++;
+	} else if (intid < 16) {
+		wake_irqs[cpu][1]++;
+	} else if (intid >= 32 && intid < 1020) {
+		wake_irqs[cpu][2]++;
+		for (unsigned i = 0; i < 6; i++) {
+			if (wake_spis[cpu][i].intid == intid || wake_spis[cpu][i].count == 0) {
+				wake_spis[cpu][i].intid = intid;
+				os_atomic_inc(&wake_spis[cpu][i].count, relaxed);
+				break;
+			}
+		}
+	} else {
+		wake_irqs[cpu][3]++;
+	}
+}
+
+void redwood_wake_timer(void *func, void *param0);
+void
+redwood_wake_timer(void *func, void *param0)
+{
+	int cpu = cpu_number();
+	bool thread_timer = func == (void *)thread_timer_expire;
+	uintptr_t key = thread_timer ? (uintptr_t)param0 : (uintptr_t)func;
+	struct wake_slot *free_slot = NULL;
+
+	if (!os_atomic_load(&redwood_cpuidle_on, relaxed) || cpu >= 8) {
+		return;
+	}
+	for (unsigned i = 0; i < WAKE_SLOTS; i++) {
+		struct wake_slot *w = &wake_timers[cpu][i];
+
+		if (w->key == key) {
+			os_atomic_inc(&w->count, relaxed);
+			return;
+		}
+		if (free_slot == NULL && w->count == 0) {
+			free_slot = w;
+		}
+	}
+	if (free_slot == NULL) {
+		return;
+	}
+	free_slot->key = 0;
+	free_slot->func = (uintptr_t)func;
+	free_slot->pid = -1;
+	free_slot->name[0] = 0;
+	if (thread_timer && param0 != NULL) {
+		thread_t thread = (thread_t)param0;
+		void *proc = get_bsdtask_info(get_threadtask(thread));
+		char tname[64] = "";
+
+		free_slot->pid = proc != NULL ? proc_pid(proc) : 0;
+		bsd_getthreadname(get_bsdthread_info(thread), tname);
+		snprintf(free_slot->name, sizeof(free_slot->name), "%s/%s", proc != NULL ? proc_name_address(proc) : "kernel",
+		    tname[0] ? tname : "-");
+		bzero(free_slot->frames, sizeof(free_slot->frames));
+		free_slot->told = false;
+		if (tname[0] == 0 && thread->kernel_stack != 0 && thread->machine.kstackptr != 0) {
+			/* it is blocked (its timeout is firing): its saved frame pointer chain, within its own stack */
+			vm_offset_t lo = thread->kernel_stack, hi = lo + kernel_stack_size;
+			arm_kernel_context_t *ctx = (arm_kernel_context_t *)thread->machine.kstackptr;
+			uint64_t fp = ctx->ss.fp;
+
+			free_slot->frames[0] = VM_KERNEL_UNSLIDE(ctx->ss.lr);
+			for (unsigned f = 1; f < 6 && fp >= lo && fp + 16 <= hi && (fp & 7) == 0; f++) {
+				free_slot->frames[f] = VM_KERNEL_UNSLIDE(((uint64_t *)fp)[1]);
+				fp = ((uint64_t *)fp)[0];
+			}
+		}
+	}
+	os_atomic_store(&free_slot->count, 1, relaxed);
+	os_atomic_store(&free_slot->key, key, release);
+}
+
+void redwood_wake_report(void);
+void
+redwood_wake_report(void)
+{
+	extern void m2m_klog(char sev, const char *cat, const char *fmt, ...);
+
+	if (!os_atomic_load(&redwood_cpuidle_on, relaxed)) {
+		return;
+	}
+	for (int cpu = 0; cpu < 8; cpu++) {
+		char line[900];
+		size_t at = 0;
+		uint32_t counts[WAKE_SLOTS];
+		uint32_t irq[4], spi_total = 0;
+
+		for (unsigned k = 0; k < 4; k++) {
+			irq[k] = os_atomic_xchg(&wake_irqs[cpu][k], 0, relaxed);
+		}
+		at += snprintf(line + at, sizeof(line) - at, "wakes core %d, 10 s: timer %u, from other cores %u, devices %u",
+		    cpu, irq[0], irq[1], irq[2]);
+		for (unsigned i = 0; i < 6; i++) {
+			uint32_t c = os_atomic_xchg(&wake_spis[cpu][i].count, 0, relaxed);
+
+			if (c != 0 && at < sizeof(line)) {
+				at += snprintf(line + at, sizeof(line) - at, "%s%u:%u", spi_total == 0 ? " (" : " ",
+				    wake_spis[cpu][i].intid, c);
+				spi_total += c;
+			}
+		}
+		if (spi_total != 0 && at < sizeof(line)) {
+			at += snprintf(line + at, sizeof(line) - at, ")");
+		}
+		for (unsigned i = 0; i < WAKE_SLOTS; i++) {
+			counts[i] = os_atomic_xchg(&wake_timers[cpu][i].count, 0, relaxed);
+		}
+		if (at < sizeof(line)) {
+			at += snprintf(line + at, sizeof(line) - at, "; callouts:");
+		}
+		/* the eight busiest */
+		for (unsigned n = 0; n < 8; n++) {
+			unsigned best = WAKE_SLOTS;
+
+			for (unsigned i = 0; i < WAKE_SLOTS; i++) {
+				if (counts[i] != 0 && (best == WAKE_SLOTS || counts[i] > counts[best])) {
+					best = i;
+				}
+			}
+			if (best == WAKE_SLOTS || at >= sizeof(line)) {
+				break;
+			}
+			struct wake_slot *w = &wake_timers[cpu][best];
+
+			if (w->pid >= 0) {
+				at += snprintf(line + at, sizeof(line) - at, " %u %s[%d]", counts[best], w->name, w->pid);
+				if (w->frames[0] != 0 && at < sizeof(line)) {
+					at += snprintf(line + at, sizeof(line) - at, "#%d.%u", cpu, best);
+					if (!w->told) {
+						w->told = true;
+						m2m_klog('I', "PERF", "wakes: thread #%d.%u waits at %#llx %#llx %#llx %#llx %#llx %#llx "
+						    "(unslid return addresses, innermost first)", cpu, best, w->frames[0], w->frames[1],
+						    w->frames[2], w->frames[3], w->frames[4], w->frames[5]);
+					}
+				}
+			} else {
+				at += snprintf(line + at, sizeof(line) - at, " %u fn %#lx", counts[best],
+				    (unsigned long)VM_KERNEL_UNSLIDE(w->func));
+			}
+			counts[best] = 0;
+		}
+		if (irq[0] + irq[1] + irq[2] != 0) {
+			m2m_klog('I', "PERF", "%s", line);
 		}
 	}
 }

@@ -9,6 +9,15 @@
 #   ./y2s.sh log                    adb: pull the 8 MiB log at recovery+16 MiB, print it (also ../xnulog.txt)
 #   ./y2s.sh mlog                   the last run's Metal and display lines only (USB if the phone is
 #                                   in Log access, else Wi-Fi), so a log can be read for those alone
+#
+# mali2metal (PLANS/10-mali2metal.md), with no key press while iOS is up on Wi-Fi:
+#   ./y2s.sh loop [label]           payload (m2m.cmdline) + pack; the phone hands itself to Log access
+#                                   (rwlogd /menu); uflash; cold restart; wait for iOS; the standard tour;
+#                                   the Metal channel saved to logs/m2m/ and reported against the last run.
+#                                   M2M_VIA=download: through Download Mode and heimdall instead (for a
+#                                   phone whose kernel predates the fixed kern.redwood_menu). M2M_PROF=1: with
+#                                   backboardd's sampling profiler over the tour (tools/prof-symbolize.py RUN)
+#   ./y2s.sh m2m <fetch|report|tour|wait-tour|tail> ...   tools/m2m.py on its own
 #   ./y2s.sh ship "<cmdline>"       payload + pack + flash
 #
 # Without Android (PLANS/09-standalone.md): the loader's menu -> "Log access (USB)", then
@@ -225,6 +234,76 @@ cmd_mlog() {
 	metal_lines < ../xnulog.txt
 }
 
+# mali2metal's loop (PLANS/10-mali2metal.md): deploy what is built, boot it, run the standard tour, keep and
+# report the Metal channel. No key press: iOS hands itself back through rwlogd's /menu (kern.redwood_menu).
+# The restart after flashing is a cold one (fastboot reboot): the warm "Boot iOS" after a return does not
+# start the kernel reliably (PLANS/09-standalone.md, open issue), and a loop must not depend on it.
+wait_ios() {
+	local host=$1 i
+	for i in $(seq 1 "$2"); do
+		curl -sf --max-time 4 "http://$host:8080/" > /dev/null 2>&1 && return 0
+		sleep 1
+	done
+	return 1
+}
+# m2m.cmdline with M2M_SET's key=value pairs put in (replacing the key's value, or appended): one run's
+# variation of the standard line, e.g. M2M_SET="cpumask=0xff dvfs_cl2=2304000"
+m2m_cmdline() {
+	local line pair key
+	line=" $(cat m2m.cmdline) "
+	for pair in ${M2M_SET:-}; do
+		key=${pair%%=*}
+		if [[ "$line" == *" $key="* ]]; then
+			line=$(printf '%s' "$line" | sed -E "s/ $key=[^ ]*/ $pair/")
+		else
+			line="$line$pair "
+		fi
+	done
+	line=${line# }
+	printf '%s' "${line% }"
+}
+
+cmd_loop() {
+	local label=${1:-} host via=${M2M_VIA:-usb} i
+	[ -f m2m.cmdline ] || die "no m2m.cmdline (the standard Metal boot line)"
+	host=$(phone_host)
+	cmd_payload "$(m2m_cmdline)"
+	cmd_pack
+	if [ "$via" = download ]; then
+		curl -sf --max-time 10 "http://$host:8080/menu?to=3" > /dev/null 2>&1 ||
+			die "the phone did not answer on http://$host:8080/menu (is iOS up and on Wi-Fi?)"
+		echo "loop: asked $host for Download Mode; waiting for the bootloader"
+		sleep 12
+		for i in 1 2 3 4 5 6 7 8; do
+			cmd_hflash > /tmp/y2s-hflash.log 2>&1 && break
+			[ "$i" = 8 ] && { tail -3 /tmp/y2s-hflash.log; die "the phone did not appear in Download Mode"; }
+			sleep 8
+		done
+		echo "loop: flashed over Download Mode ($(md5 -q out/y2s-recovery.img)); the phone restarts by itself"
+	else
+		if ! "$FASTBOOT" devices 2>/dev/null | grep -q fastboot; then
+			curl -sf --max-time 10 "http://$host:8080/menu?to=1" > /dev/null 2>&1 ||
+				die "the phone is neither in Log access nor answering on http://$host:8080 (is iOS up and on Wi-Fi?)"
+			echo "loop: asked $host for Log access"
+		fi
+		cmd_uflash
+		cmd_ureboot
+	fi
+	echo "loop: waiting for iOS on Wi-Fi"
+	wait_ios "$host" 300 || die "iOS did not come up on Wi-Fi in 5 minutes: put the phone in Log access and ./y2s.sh ulog"
+	echo "loop: iOS is up; 45 s for SpringBoard to settle, then the tour"
+	sleep 45
+	# M2M_PROF=1: backboardd's sampling profiler over the whole tour (its report comes after "prof: end")
+	[ -n "${M2M_PROF:-}" ] && python3 tools/m2m.py notify prof
+	python3 tools/m2m.py tour
+	python3 tools/m2m.py wait-tour --timeout 300 || echo "loop: the tour did not finish; the channel is kept as it is"
+	if [ -n "${M2M_PROF:-}" ]; then
+		python3 tools/m2m.py notify prof
+		python3 tools/m2m.py wait 'prof: end' --timeout 180 || echo "loop: the profiler's report did not finish"
+	fi
+	python3 tools/m2m.py report "$(python3 tools/m2m.py fetch --label "$label")"
+}
+
 cmd_uboot() {
 	fb_wait
 	"$FASTBOOT" oem boot > /dev/null 2>&1 || true
@@ -303,6 +382,8 @@ ulog) cmd_ulog ;;
 mlog) cmd_mlog ;;
 uflash) cmd_uflash ;;
 uboot) cmd_uboot ;;
+loop) cmd_loop "${2:-}" ;;
+m2m) shift; python3 tools/m2m.py "$@" ;;
 hflash) cmd_hflash ;;
 hlogo) cmd_hlogo ;;
 ureboot) cmd_ureboot ;;

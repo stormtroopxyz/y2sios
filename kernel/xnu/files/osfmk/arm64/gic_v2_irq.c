@@ -283,11 +283,30 @@ gic_v3_spi_unmask(uint32_t intid)
  * runs in interrupt context, before the interrupt is ended; a level-triggered
  * one has to quiet the source or mask it (gic_v3_spi_mask()). Thread context.
  */
+kern_return_t gic_v3_spi_attach_to(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid),
+    void *context, int cpu);
+
 kern_return_t
 gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context)
 {
-	uint32_t cpuif = gic_cpuif_self();
+	return gic_v3_spi_attach_to(intid, edge, handler, context, -1);
+}
+
+/* ... targeted at processor `cpu` (cpu_number(); -1: this one) instead: a per-core timer (psci_smp.c's cpuidle) */
+kern_return_t
+gic_v3_spi_attach_to(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context,
+    int cpu)
+{
+	uint32_t cpuif;
 	struct gic_spi *slot = NULL;
+
+	if (cpu < 0) {
+		cpuif = gic_cpuif_self();
+	} else if (cpu < MAX_CPUS && gic_cpuif_seen[cpu]) {
+		cpuif = gic_cpuif[cpu];
+	} else {
+		return KERN_INVALID_ARGUMENT;
+	}
 	uint32_t config;
 
 	if (gicd_base == 0 || intid < GIC_INTID_SPI_MIN || intid >= GIC_INTID_SPURIOUS || handler == NULL) {
@@ -371,6 +390,11 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 			break;
 		}
 		gic_active_iar[cpu] = iar;
+		{
+			extern void redwood_wake_irq(int cpu, uint32_t intid);
+
+			redwood_wake_irq(cpu, intid);   /* what wakes the cores (psci_smp.c) */
+		}
 
 		if (intid == GIC_INTID_VTIMER) {
 			/* same sequence as the FIQ path in sleh_fiq() */
@@ -442,6 +466,44 @@ gic_v3_irq_cpu_shutdown(void)
 	gic_write32(gicd_base + GICD_ICPENDR(0), 0xffffffffu);
 	gic_write32(gicd_base + GICD_ICACTIVER(0), 0xffffffffu);
 	gic_write32(gicc_base + GICC_CTLR, 0);
+	__builtin_arm_dsb(DSB_SY);
+}
+
+/*
+ * A core back from a power-down (PSCI CPU_SUSPEND: psci_smp.c's cpuidle). As Linux's GICv2 cpu_pm exit
+ * (irq-gic.c gic_cpu_restore + gic_cpu_if_up): its CPU interface and its banked SGI/PPI setup are written
+ * again, in case the power-down took them. What they read before that is kept for the record (the first
+ * time on each core): whether they had in fact been lost.
+ */
+uint32_t gic_resume_seen[MAX_CPUS][2];  /* GICC_CTLR << 16 | GICC_PMR, GICD_ISENABLER0; bit 31 of [0]: set */
+void gic_v3_irq_cpu_resume(void);
+void
+gic_v3_irq_cpu_resume(void)
+{
+	int cpu = cpu_number();
+	uint32_t mine = 1u << GIC_INTID_VTIMER;
+
+	if (gicd_base == 0) {
+		return;
+	}
+	if (!(gic_resume_seen[cpu][0] & (1u << 31))) {
+		gic_resume_seen[cpu][1] = gic_read32(gicd_base + GICD_ISENABLER(0));
+		gic_resume_seen[cpu][0] = (1u << 31) | (gic_read32(gicc_base + GICC_CTLR) & 0x7fff) << 16 |
+		    (gic_read32(gicc_base + GICC_PMR) & 0xffff);
+	}
+	if (ml_get_cpu_count() > 1) {
+		uint32_t sgis = (1u << GIC_SGI_SIGNAL) | (1u << GIC_SGI_STOP);
+
+		gic_write8(gicd_base + GICD_IPRIORITYR + GIC_SGI_SIGNAL, GIC_PRIORITY_DEFAULT);
+		gic_write8(gicd_base + GICD_IPRIORITYR + GIC_SGI_STOP, GIC_PRIORITY_DEFAULT);
+		mine |= sgis;
+	}
+	gic_write32(gicd_base + GICD_IGROUPR(0), gic_read32(gicd_base + GICD_IGROUPR(0)) | mine);
+	gic_write8(gicd_base + GICD_IPRIORITYR + GIC_INTID_VTIMER, GIC_PRIORITY_DEFAULT);
+	gic_write32(gicd_base + GICD_ISENABLER(0), mine);
+	gic_write32(gicc_base + GICC_PMR, 0xff);
+	gic_write32(gicc_base + GICC_BPR, 0);
+	gic_write32(gicc_base + GICC_CTLR, GICC_CTLR_ENABLE_GRP1);
 	__builtin_arm_dsb(DSB_SY);
 }
 

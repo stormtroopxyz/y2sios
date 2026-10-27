@@ -33,6 +33,10 @@ The BCM4375 driver draws on Linux's `brcmfmac`, which is ISC licensed, and on th
 
 The documentation cites `Bentlybro/z3s-mainline-linux`, a GPL-2.0 Linux tree for the same SoC, and Samsung's GPL-2.0 kernel sources. They are used as references. No GPL source is linked into XNU. The reports in `docs/research/` are summaries written for this port, not copies of those trees.
 
+## itlwm
+
+The Apple80211 structures used for the Wi-Fi signal and noise reports were checked against the published headers and driver of `OpenIntelWireless/itlwm`. It is used as a reference only. No itlwm code is included.
+
 ## libdeflate
 
 `kernel/xnu/files/bsd/miscfs/apfs/libdeflate/` is MIT licensed. The licence text is kept beside the sources.

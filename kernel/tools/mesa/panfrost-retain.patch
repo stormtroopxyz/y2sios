@@ -1,0 +1,92 @@
+Redwood (the Exynos 990 port): Panfrost's BO cache keeps idle BOs 30 s within a 64 MB budget instead of
+2 s, and counts what it does (redwood_bo_cache_stats) -- PLANS/10-mali2metal.md, runs 17-19.
+
+--- a/src/gallium/drivers/panfrost/pan_bo.c	2026-10-27 11:52:20
++++ b/src/gallium/drivers/panfrost/pan_bo.c	2026-10-27 11:52:20
+@@ -39,6 +39,23 @@
+ #include "util/u_inlines.h"
+ #include "util/u_math.h"
+ 
++/*
++ * Redwood (the Exynos 990 port's Metal): what the cache keeps, and what it did. CoreAnimation makes its
++ * offscreen targets in bursts 5-25 s apart and keeps them 1-4 s (PLANS/10-mali2metal.md, run 19), so with
++ * upstream's "drop what has been idle 2 s" every burst found the cache empty and paid an allocation and a
++ * mapping in the kernel per texture. Here an idle BO is kept up to REDWOOD_BO_IDLE_S seconds, and the cache
++ * holds at most REDWOOD_BO_BUDGET bytes, oldest let go first. The counters are read by
++ * tools/mesa/air/air_metal.c for the channel's records.
++ */
++#define REDWOOD_BO_IDLE_S 30
++#define REDWOOD_BO_BUDGET (64ull << 20)
++
++struct redwood_bo_cache_stats {
++   uint64_t hits, misses, evicted, evicted_bytes;
++   uint64_t cached_bytes, cached_bos;
++};
++struct redwood_bo_cache_stats redwood_bo_cache_stats;
++
+ /* This file implements a userspace BO cache. Allocating and freeing
+  * GPU-visible buffers is very expensive, and even the extra kernel roundtrips
+  * adds more work than we would like at this point. So caching BOs in userspace
+@@ -254,6 +271,11 @@
+       bo = entry;
+       bo->label = label;
+       break;
++   }
++   if (bo) {
++      redwood_bo_cache_stats.hits++;
++      redwood_bo_cache_stats.cached_bytes -= panfrost_bo_size(bo);
++      redwood_bo_cache_stats.cached_bos--;
+    }
+    pthread_mutex_unlock(&dev->bo_cache.lock);
+ 
+@@ -276,11 +298,17 @@
+        * seconds old, but we don't really care, as long as unused BOs
+        * are dropped at some point.
+        */
+-      if (time.tv_sec - entry->last_used <= 2)
++      /* (Redwood: kept for REDWOOD_BO_IDLE_S, and only while the cache is within its budget) */
++      if (time.tv_sec - entry->last_used <= REDWOOD_BO_IDLE_S &&
++          redwood_bo_cache_stats.cached_bytes <= REDWOOD_BO_BUDGET)
+          break;
+ 
+       list_del(&entry->bucket_link);
+       list_del(&entry->lru_link);
++      redwood_bo_cache_stats.evicted++;
++      redwood_bo_cache_stats.evicted_bytes += panfrost_bo_size(entry);
++      redwood_bo_cache_stats.cached_bytes -= panfrost_bo_size(entry);
++      redwood_bo_cache_stats.cached_bos--;
+       panfrost_bo_free(entry);
+    }
+ }
+@@ -308,6 +336,8 @@
+ 
+    /* Add us to the bucket */
+    list_addtail(&bo->bucket_link, bucket);
++   redwood_bo_cache_stats.cached_bytes += panfrost_bo_size(bo);
++   redwood_bo_cache_stats.cached_bos++;
+ 
+    /* Add us to the LRU list and update the last_used field. */
+    list_addtail(&bo->lru_link, &dev->bo_cache.lru);
+@@ -343,6 +373,10 @@
+       list_for_each_entry_safe(struct panfrost_bo, entry, bucket, bucket_link) {
+          list_del(&entry->bucket_link);
+          list_del(&entry->lru_link);
++         redwood_bo_cache_stats.evicted++;
++         redwood_bo_cache_stats.evicted_bytes += panfrost_bo_size(entry);
++         redwood_bo_cache_stats.cached_bytes -= panfrost_bo_size(entry);
++         redwood_bo_cache_stats.cached_bos--;
+          panfrost_bo_free(entry);
+       }
+    }
+@@ -413,8 +447,10 @@
+     * to make space for the new allocation.
+     */
+    bo = panfrost_bo_cache_fetch(dev, size, flags, label, true);
+-   if (!bo)
++   if (!bo) {
++      p_atomic_inc(&redwood_bo_cache_stats.misses);
+       bo = panfrost_bo_alloc(dev, size, flags, label);
++   }
+    if (!bo)
+       bo = panfrost_bo_cache_fetch(dev, size, flags, label, false);
+    if (!bo) {

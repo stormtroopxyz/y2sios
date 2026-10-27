@@ -27,6 +27,7 @@ struct redwood_sta_bss {
 	uint8_t ssid[32], ssid_length;
 	uint16_t frequency;                     /* MHz */
 	int16_t rssi;                           /* dBm */
+	int16_t noise;                          /* dBm, the radio's noise floor on its channel; 0: not known */
 	uint16_t beacon_interval;               /* in units of 1024 microseconds */
 	uint16_t capability;                    /* the beacon's capability field */
 	uint32_t age_ms;                        /* how long ago it was last heard */

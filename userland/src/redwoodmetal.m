@@ -83,10 +83,9 @@
  * What is NOT here, and is not pretended: heaps, blit encoders, events, multisample
  * resolve, and the rectangle half of a viewport -- the rest of docs/metal.md 10.8.
  *
- * Every line this file writes carries the PROCESS it was written by
- * (`redwoodmetal[progname pid]:`, see rw_print): a driver is a library, four or five
- * Metal clients are alive in one boot of this port, and a refusal nobody can attribute
- * is half a refusal.
+ * Every sentence this file writes is a record in mali2metal's channel (m2m.h, /dev/m2m), which
+ * carries the PROCESS it was written by: a driver is a library, four or five Metal clients are
+ * alive in one boot of this port, and a refusal nobody can attribute is half a refusal.
  */
 
 #import <Foundation/Foundation.h>
@@ -97,11 +96,13 @@
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/thread_status.h>
+#include <sys/resource.h>
 #include <notify.h>
 #include <pthread.h>
 #include <Block.h>
 
 #include "redwood_drawable.h"
+#include "m2m.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,6 +126,7 @@ struct rwa_compute_info {
 	 * every field above keeps the offset this file already reads -- and this file and
 	 * the library still have to be rebuilt together. */
 	unsigned argbuf_mask;
+	unsigned null_query_textures;   /* slots the shader asks is_null_texture about (appended) */
 };
 struct rwa_texture_shape {
 	unsigned pixel_format, type, width, height, depth;
@@ -328,8 +330,13 @@ struct rwa_draw {
 	unsigned clear_color_mask;     /* bit i: attachment i clears, to clear_colors[4i..4i+3] */
 	const float *clear_colors;
 	const float *viewport;         /* x, y, width, height, or NULL: the whole attachment */
+	/* appended with air_metal.h's (27 October): each attachment's level and slice */
+	const unsigned *color_level;
+	const unsigned *color_layer;
+	unsigned depth_level, depth_layer;
 };
-_Static_assert(sizeof(struct rwa_draw) == 304 && offsetof(struct rwa_draw, viewport) == 296,
+_Static_assert(sizeof(struct rwa_draw) == 328 && offsetof(struct rwa_draw, viewport) == 296 &&
+	       offsetof(struct rwa_draw, color_level) == 304 && offsetof(struct rwa_draw, depth_level) == 320,
 	       "struct rwa_draw must match tools/mesa/air/air_metal.h");
 
 /*
@@ -453,46 +460,23 @@ _Static_assert(sizeof(struct rwa_render_info) == 116 &&
 	       "one the LIBRARY writes into: too short is a buffer overrun");
 
 /*
- * WHOSE SENTENCE THIS IS. Every line this driver writes goes through here, and the reason
- * is an attribution that could not be made: a boot's log held
+ * WHERE THIS DRIVER'S SENTENCES GO: mali2metal's channel (m2m.h -> /dev/m2m), one record per
+ * sentence, each with a severity and a category (PLANS/10-mali2metal.md):
  *
- *     redwoodmetal: fragment buffer 2 at offset 1164: ...
- *     redwoodmetal: no drawable: pixel format 500 is not one ...
+ *   I information  W declined or degraded  E an error  F fatal
+ *   DEV the device and the compiler library   PSO pipeline states   FUNC function lookups and
+ *   constants   RES buffers, textures, samplers, depth/stencil states   SURF drawables and IOSurfaces
+ *   ENC encoder state and draws refused or not implemented   CMD command buffers and the GPU work
+ *   in them   PERF where the time goes   SUM a process's totals   TRACE what was asked for by a
+ *   notification (trace, dump, snap)
  *
- * one after the other, and four or five Metal clients were alive in that boot (backboardd,
- * SpringBoard, chronod and this port's own application). The drawable refusal was pinned on
- * backboardd only by reading QuartzCore's own os_log line beside it, which is a guess, and
- * the offset refusals could not be attributed at all. A driver is a library: its lines are
- * written by somebody else's process, and the process is the first thing a reader needs.
- *
- * So the prefix is `redwoodmetal[progname pid]:`, built once per process -- getprogname()
- * is the name launchd or the shell gave it, which is what the log's other lines carry too.
- *
- * It flushes, for the reason RW_ONCE below flushes: stdio to a console is block-buffered,
- * the processes that reach these sites are the ones that then abort, and a line written and
- * not flushed dies with the process. One flush per sentence costs nothing next to the draw
- * that provoked it.
+ * The kernel stamps the time and the process (a driver is a library: its sentences are written by
+ * somebody else's process, and the process is the first thing a reader needs), and a record is one
+ * write(2), so nothing waits in stdio to die with a process that then aborts.
  */
-static void rw_print(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-/* and the one method this driver installs into Metal's own function class, whose reason
- * is a measurement and is written where it is done (the end of this file) */
+/* the one method this driver installs into Metal's own function class, whose reason is a
+ * measurement and is written where it is done (the end of this file) */
 static void ensure_function_encoder(void);
-
-static void
-rw_print(const char *fmt, ...)
-{
-	static char who[96];
-	va_list ap;
-
-	if (who[0] == '\0') {
-		snprintf(who, sizeof(who), "redwoodmetal[%s %d]", getprogname(), getpid());
-	}
-	printf("%s: ", who);
-	va_start(ap, fmt);
-	vprintf(fmt, ap);
-	va_end(ap);
-	fflush(stdout);
-}
 
 static struct {
 	void *handle;
@@ -516,6 +500,12 @@ static struct {
 	int (*depth_read)(struct rwa_texture *, unsigned, unsigned, const unsigned[3],
 			  const unsigned[3], float *, uint8_t *, char *, size_t);
 	void (*texture_destroy)(struct rwa_texture *);
+	int (*gpu_cache_stats)(uint64_t[6]);   /* (optional) the GPU driver's buffer cache: rwa_gpu_cache_stats */
+	int (*ubo_stats)(uint64_t[3]);         /* (optional) constant buffers bound directly or copied: rwa_ubo_stats */
+	struct rwa_texture *(*texture_from_buffer)(struct rwa_buffer *, const struct rwa_texture_shape *, size_t,
+						   size_t, char *, size_t);
+	struct rwa_texture *(*texture_view)(struct rwa_texture *, unsigned, unsigned, unsigned,
+					    unsigned, unsigned, unsigned, char *, size_t);
 	struct rwa_sampler *(*sampler_create)(struct rwa_device *,
 					      const struct rwa_sampler_state *, char *, size_t);
 	void (*sampler_destroy)(struct rwa_sampler *);
@@ -570,7 +560,7 @@ mesa_available(void)
 	tried = true;
 	mesa.handle = dlopen("/redwood/lib/libredwoodair.dylib", RTLD_NOW);
 	if (mesa.handle == NULL) {
-		rw_print("no compiler library: %s\n", dlerror());
+		m2m_log('E', "DEV", "no compiler library: %s\n", dlerror());
 		return false;
 	}
 	*(void **)&mesa.device_open = dlsym(mesa.handle, "rwa_device_open");
@@ -587,6 +577,10 @@ mesa_available(void)
 	*(void **)&mesa.texture_read = dlsym(mesa.handle, "rwa_texture_read");
 	*(void **)&mesa.depth_read = dlsym(mesa.handle, "rwa_depth_read");
 	*(void **)&mesa.texture_destroy = dlsym(mesa.handle, "rwa_texture_destroy");
+	*(void **)&mesa.texture_view = dlsym(mesa.handle, "rwa_texture_view");
+	*(void **)&mesa.gpu_cache_stats = dlsym(mesa.handle, "rwa_gpu_cache_stats");
+	*(void **)&mesa.ubo_stats = dlsym(mesa.handle, "rwa_ubo_stats");
+	*(void **)&mesa.texture_from_buffer = dlsym(mesa.handle, "rwa_texture_from_buffer");
 	*(void **)&mesa.sampler_create = dlsym(mesa.handle, "rwa_sampler_create");
 	*(void **)&mesa.sampler_destroy = dlsym(mesa.handle, "rwa_sampler_destroy");
 	*(void **)&mesa.dispatch = dlsym(mesa.handle, "rwa_dispatch");
@@ -627,7 +621,7 @@ mesa_available(void)
 		 * an older library would be called with the wrong shape of argument and do
 		 * something arbitrary. Refusing it outright is the only safe reading of a
 		 * missing rwa_texture_create. */
-		rw_print("the compiler library is missing calls the contract names, "
+		m2m_log('E', "DEV", "the compiler library is missing calls the contract names, "
 		         "so it is older than this driver and will not be used\n");
 		dlclose(mesa.handle);
 		mesa.handle = NULL;
@@ -640,46 +634,36 @@ mesa_available(void)
  * Say a thing once, per place that says it.
  *
  * Every method of this driver that declines to do something is called by a daemon that will
- * call it again on the next frame, so a line per call buries the log that matters and a
- * silent return tells us nothing at all. One line the first time a site is reached is what
- * names the feature the system actually wanted -- which is the whole value of answering
- * "no" instead of being absent: an absent selector aborts the daemon and says nothing, an
- * answer that refuses keeps it running AND leaves its name in the log.
- *
- * And it is flushed, because the measurement says it has to be: searching every log in
- * `logs/` for four different RW_ONCE strings -- the GPU priority, the one ring, the texture
- * view, the resource ID -- finds them **zero** times, while plain printf lines from these
- * same files are in every boot. The processes that reach these sites are the ones that then
- * abort (backboardd aborted 43 times in logs/214841-run.log), and stdio to a console is
- * block-buffered, so a line written and not flushed dies with the process. That is a
- * suspicion with evidence rather than a proof -- the sites may also simply never have been
- * reached -- and the flush is what makes the next boot able to tell the two apart: a line
- * that is now still missing was never reached. One flush per site per process costs nothing;
- * a diagnostic that has never once been seen costs the whole point of writing it.
+ * call it again on the next frame, so a record per call buries the evidence that matters and a
+ * silent return tells nothing at all. One record the first time a site is reached names the
+ * feature the system actually wanted -- which is the whole value of answering "no" instead of
+ * being absent: an absent selector aborts the daemon and says nothing, an answer that refuses
+ * keeps it running AND leaves its name in the channel.
  */
-#define RW_ONCE(...)							\
+#define RW_ONCE(sev, cat, ...)						\
 	do {								\
 		static BOOL rw_said_;					\
 									\
 		if (!rw_said_) {					\
 			rw_said_ = YES;					\
-			rw_print(__VA_ARGS__);				\
+			m2m_log(sev, cat, __VA_ARGS__);			\
 		}							\
 	} while (0)
 
 /*
- * A sentence that is true every time it is reached and says nothing new after the first: print
- * it, then only on powers of two, carrying the count. The window server asks this driver for a
- * two-plane YCbCr drawable 862 times in a boot, and 862 identical lines pushed the rest of that
- * boot out of the loader's log, which keeps the first 256 KB and the last megabyte. A refusal
- * that drowns the evidence of what it refused is a worse instrument than a quiet one.
+ * A sentence that is true every time it is reached and says nothing new after the first: a
+ * record the first time, then only on powers of two, each carrying the count ("[repeat N]").
+ * The window server asked for a two-plane YCbCr drawable 862 times in one boot; 862 identical
+ * records would push the rest of that boot out of the channel's ring.
  *
  * Every site also registers itself the first time (rw_site_count), so the end-of-run summary
  * (rw_stats_print) gives each repeated sentence's exact total.
  */
 static void rw_site_count(unsigned line, const char *fmt, unsigned long *times);
+static void rw_log_repeat(char sev, const char *cat, unsigned long times, const char *fmt, ...)
+	__attribute__((format(printf, 4, 5)));
 #define RW_FIRST_(a, ...) a
-#define RW_AGAIN(...)							\
+#define RW_AGAIN(sev, cat, ...)						\
 	do {								\
 		static unsigned long rw_times_;				\
 		unsigned long rw_n_ = ++rw_times_;			\
@@ -688,13 +672,30 @@ static void rw_site_count(unsigned line, const char *fmt, unsigned long *times);
 			rw_site_count(__LINE__, RW_FIRST_(__VA_ARGS__, 0), &rw_times_); \
 		}							\
 		if ((rw_n_ & (rw_n_ - 1)) == 0) {			\
-			rw_print(__VA_ARGS__);				\
-			if (rw_n_ > 1) {				\
-				rw_print("  ... and that is the %lu'th "\
-					 "time\n", rw_n_);		\
-			}						\
+			rw_log_repeat(sev, cat, rw_n_, __VA_ARGS__);	\
 		}							\
 	} while (0)
+
+static void
+rw_log_repeat(char sev, const char *cat, unsigned long times, const char *fmt, ...)
+{
+	char msg[M2M_RECORD_MAX];
+	va_list ap;
+	size_t n;
+
+	va_start(ap, fmt);
+	vsnprintf(msg, sizeof(msg), fmt, ap);
+	va_end(ap);
+	n = strlen(msg);
+	while (n > 0 && msg[n - 1] == '\n') {
+		msg[--n] = '\0';
+	}
+	if (times > 1) {
+		m2m_log(sev, cat, "%s [repeat %lu]", msg, times);
+	} else {
+		m2m_log(sev, cat, "%s", msg);
+	}
+}
 
 /*
  * THE RUN'S OWN ACCOUNT: what this process asked the driver for and what it got, printed in
@@ -744,10 +745,74 @@ static volatile int rw_trace_force;
  */
 static struct {
 	uint64_t commits, draws, commit_ns, wait_ns, commit_max, wait_max;
+	/* an asynchronous commit's whole way to its completed handlers: queued behind earlier completions on
+	 * the process's one completion queue, the GPU fence, the handlers (redwoodAsyncComplete) */
+	uint64_t completions, completion_ns, completion_max;
 	uint64_t compiles, compile_ns, compile_max;
 	uint64_t copies, copy_bytes, copy_ns;
 	uint64_t slow;                 /* commits over RWM_SLOW_MS */
+	/* where a draw's time goes: the whole of -runDraw (binding this process's own objects
+	 * into the shapes the library takes) and the library's own call inside it (Gallium ->
+	 * Panfrost -> the command stream). The split says which one to work on. */
+	uint64_t draw_calls, draw_ns, gallium_ns;
+	/* what was allocated and let go: each made buffer or texture is a GPU allocation (a kernel
+	 * call when Panfrost's cache has nothing that fits), and the time is the library's call */
+	uint64_t buf_made, buf_bytes, buf_ns, buf_freed, tex_made, tex_ns, tex_freed;
+	uint64_t tex_life_ns;          /* summed lifetime of the made textures freed in the window */
 } rw_perf;
+
+/* (rw_perf_tick) the shapes of the textures made in the window, by count: what a reuse of texture
+ * memory would have to be keyed on */
+static struct {
+	struct rwa_texture_shape shape;
+	unsigned count;
+} rw_tex_shapes[24];
+static unsigned rw_tex_shapes_used, rw_tex_shapes_other;
+static const char *rw_texture_type_name(unsigned type);
+
+/* (rw_perf) one allocation made: a texture of `shape`, or a buffer of `bytes`, in `ns`; or one let go */
+static void
+rw_note_alloc(const struct rwa_texture_shape *shape, uint64_t bytes, uint64_t ns)
+{
+	pthread_mutex_lock(&rw_stats_lock);
+	if (shape != NULL) {
+		unsigned i;
+
+		rw_perf.tex_made++;
+		rw_perf.tex_ns += ns;
+		for (i = 0; i < rw_tex_shapes_used; i++) {
+			if (memcmp(&rw_tex_shapes[i].shape, shape, sizeof(*shape)) == 0) {
+				break;
+			}
+		}
+		if (i < rw_tex_shapes_used) {
+			rw_tex_shapes[i].count++;
+		} else if (rw_tex_shapes_used < sizeof(rw_tex_shapes) / sizeof(rw_tex_shapes[0])) {
+			rw_tex_shapes[rw_tex_shapes_used].shape = *shape;
+			rw_tex_shapes[rw_tex_shapes_used++].count = 1;
+		} else {
+			rw_tex_shapes_other++;
+		}
+	} else {
+		rw_perf.buf_made++;
+		rw_perf.buf_bytes += bytes;
+		rw_perf.buf_ns += ns;
+	}
+	pthread_mutex_unlock(&rw_stats_lock);
+}
+
+static void
+rw_note_free(bool texture, uint64_t lived_ns)
+{
+	pthread_mutex_lock(&rw_stats_lock);
+	if (texture) {
+		rw_perf.tex_freed++;
+		rw_perf.tex_life_ns += lived_ns;
+	} else {
+		rw_perf.buf_freed++;
+	}
+	pthread_mutex_unlock(&rw_stats_lock);
+}
 
 /*
  * THE FOCUSED LOG: what a frame is made of, by pipeline label.
@@ -877,7 +942,7 @@ rw_vertex_layout_line(NSString *line)
 	}
 	pthread_mutex_unlock(&lock);
 	if (fresh) {
-		rw_print("vertex layout:%s\n", [line UTF8String]);
+		m2m_log('I', "TRACE", "vertex layout:%s\n", [line UTF8String]);
 	}
 }
 static NSCountedSet *rw_refusals;       /* the library's sentence, per refused pipeline */
@@ -927,20 +992,20 @@ static void
 rw_stats_print(void)
 {
 	pthread_mutex_lock(&rw_stats_lock);
-	rw_print("==== METAL SUMMARY: render pipelines %u ok, %u refused; compute pipelines %u ok, "
+	m2m_log('I', "SUM", "==== METAL SUMMARY: render pipelines %u ok, %u refused; compute pipelines %u ok, "
 	    "%u refused; pipelines on a generic (unspecialised) function: %u ok, %u refused; "
 	    "function lookups with constants %u (%u nil, %u generic)\n",
 	    rw_stats.render_ok, rw_stats.render_refused, rw_stats.compute_ok,
 	    rw_stats.compute_refused, rw_stats.generic_ok, rw_stats.generic_refused,
 	    rw_stats.lookups, rw_stats.lookups_nil, rw_stats.lookups_generic);
-	rw_print("==== METAL SUMMARY: render passes %u, of which %u have attachments that load "
+	m2m_log('I', "SUM", "==== METAL SUMMARY: render passes %u, of which %u have attachments that load "
 	    "differently\n", rw_passes, rw_mixed_passes);
 	for (NSString *why in rw_refusals) {
-		rw_print("==== METAL SUMMARY: refused %lux: %s\n",
+		m2m_log('I', "SUM", "==== METAL SUMMARY: refused %lux: %s\n",
 		    (unsigned long)[rw_refusals countForObject:why], [why UTF8String]);
 	}
 	for (NSString *name in rw_generic_names) {
-		rw_print("==== METAL SUMMARY: generic function %lux: %s\n",
+		m2m_log('I', "SUM", "==== METAL SUMMARY: generic function %lux: %s\n",
 		    (unsigned long)[rw_generic_names countForObject:name], [name UTF8String]);
 	}
 	for (unsigned i = 0; i < rw_num_sites; i++) {
@@ -953,10 +1018,10 @@ rw_stats_print(void)
 				first[k] = ' ';
 			}
 		}
-		rw_print("==== METAL SUMMARY: repeated %lux (redwoodmetal.m:%u): %s\n",
+		m2m_log('I', "SUM", "==== METAL SUMMARY: repeated %lux (redwoodmetal.m:%u): %s\n",
 		    *rw_sites[i].times, rw_sites[i].line, first);
 	}
-	rw_print("==== METAL SUMMARY: end\n");
+	m2m_log('I', "SUM", "==== METAL SUMMARY: end\n");
 	pthread_mutex_unlock(&rw_stats_lock);
 }
 
@@ -970,7 +1035,8 @@ rw_stats_print(void)
  * named afterwards from the library this was built with -- and the callers of the busiest.
  */
 #define RW_PROF_MAX     (1u << 16)
-#define RW_PROF_DEPTH   6               /* pc, lr, then four return addresses up the frame-pointer chain */
+#define RW_PROF_DEPTH   12              /* pc, lr, then ten return addresses up the frame-pointer chain */
+#define RW_PROF_SHOWN   6               /* (of which the busiest functions' callers show the first six) */
 #define RW_PROF_VA      0x0000007FFFFFFFFFULL   /* (what is above an address: pointer authentication) */
 static volatile int rw_prof_on;
 static uint64_t (*rw_prof_stack)[RW_PROF_DEPTH];
@@ -1122,7 +1188,7 @@ rw_prof_report(void)
 		i = j;
 	}
 	qsort(fn, fns, sizeof(*fn), rw_prof_by_samples);
-	rw_print("prof: %u samples in %.1f s (%u rounds of every thread every 2 ms: %.2f threads running on average), %u functions\n",
+	m2m_log('I', "PERF", "prof: %u samples in %.1f s (%u rounds of every thread every 2 ms: %.2f threads running on average), %u functions\n",
 	    n, secs, rw_prof_rounds, rw_prof_rounds ? (double)n / rw_prof_rounds : 0.0, fns);
 	for (uint32_t f = 0; f < fns && f < 60; f++) {
 		char callers[1200] = "";
@@ -1162,7 +1228,7 @@ rw_prof_report(void)
 					uint32_t keep = which[bestAt];
 
 					at += (size_t)snprintf(callers + at, sizeof(callers) - at, "\n    %u%%:", best * 100 / m);
-					for (unsigned k = 1; k < RW_PROF_DEPTH && rw_prof_stack[keep][k] != 0 && at < sizeof(callers); k++) {
+					for (unsigned k = 1; k < RW_PROF_SHOWN && rw_prof_stack[keep][k] != 0 && at < sizeof(callers); k++) {
 						Dl_info info;
 						uint64_t a = rw_prof_stack[keep][k];
 
@@ -1184,14 +1250,71 @@ rw_prof_report(void)
 			}
 			free(which);
 		}
-		rw_print("prof: %5.1f%% %6u %s+%#llx %s%s\n", n ? fn[f].samples * 100.0 / n : 0.0, fn[f].samples, fn[f].image,
+		m2m_log('I', "PERF", "prof: %5.1f%% %6u %s+%#llx %s%s\n", n ? fn[f].samples * 100.0 / n : 0.0, fn[f].samples, fn[f].image,
 		    (unsigned long long)(fn[f].start - fn[f].base), fn[f].name ? fn[f].name : "?", callers);
 	}
 	/* every address of the stripped library sampled twice or more, for tools/prof-symbolize.py to add up by function */
 	for (uint32_t f = 0; f < fns; f++) {
 		if (fn[f].samples >= 2 && strstr(fn[f].image, "libredwoodair") != NULL) {
-			rw_print("prof: air %#llx %u\n", (unsigned long long)(fn[f].start - fn[f].base), fn[f].samples);
+			m2m_log('I', "PERF", "prof: air %#llx %u\n", (unsigned long long)(fn[f].start - fn[f].base), fn[f].samples);
 		}
+	}
+	/*
+	 * Inclusive time inside the compiler library: each sample's frames that are in libredwoodair, as
+	 * offsets, innermost first, and the image its pc was in when that is elsewhere (memcpy, the kernel):
+	 * such a sample still counts for the library functions above it. Samples with the same frames are
+	 * counted together (sorted, then runs); tools/prof-symbolize.py names the offsets and adds every
+	 * function's inclusive and self samples up. Paced under the channel's 400 records a second.
+	 */
+	{
+		Dl_info air;
+		uint64_t base = 0;
+		char (*key)[160] = calloc(n ? n : 1, sizeof(*key));
+		uint32_t inside = 0;
+
+		memset(&air, 0, sizeof(air));
+		if (mesa.handle != NULL && mesa.render_draw != NULL && dladdr((const void *)mesa.render_draw, &air)) {
+			base = (uint64_t)air.dli_fbase;
+		}
+		for (uint32_t i = 0; base != 0 && key != NULL && i < n; i++) {
+			size_t at = 0;
+			unsigned frames = 0;
+
+			for (unsigned k = 0; k < RW_PROF_DEPTH && at < sizeof(key[0]) - 24; k++) {
+				Dl_info info;
+				uint64_t addr = rw_prof_stack[i][k];
+
+				if (k == 1 || addr == 0) {
+					continue;       /* (lr: a leaf's caller or a stale value; the frame chain says the same) */
+				}
+				memset(&info, 0, sizeof(info));
+				if (dladdr((const void *)addr, &info) && info.dli_fbase == (void *)base) {
+					at += (size_t)snprintf(key[inside] + at, sizeof(key[0]) - at, " %#llx", (unsigned long long)(addr - base));
+					frames++;
+				} else if (k == 0) {
+					at += (size_t)snprintf(key[inside] + at, sizeof(key[0]) - at, " out:%s", rw_prof_leaf(info.dli_fname));
+				}
+			}
+			if (frames != 0) {
+				inside++;
+			} else {
+				key[inside][0] = '\0';
+			}
+		}
+		if (key != NULL && inside != 0) {
+			qsort(key, inside, sizeof(key[0]), (int (*)(const void *, const void *))strcmp);
+			for (uint32_t i = 0; i < inside;) {
+				uint32_t j = i;
+
+				while (j < inside && strcmp(key[j], key[i]) == 0) {
+					j++;
+				}
+				m2m_log('I', "PERF", "prof: airstack %u%s\n", j - i, key[i]);
+				usleep(2600);
+				i = j;
+			}
+		}
+		free(key);
 	}
 	/* by image too: how much is Mesa's, CoreAnimation's, the kernel's (time in a call into it) */
 	{
@@ -1214,11 +1337,11 @@ rw_prof_report(void)
 		}
 		for (uint32_t k = 0; k < imgs; k++) {
 			if (n && img[k].samples * 100 / n >= 1) {
-				rw_print("prof: image %5.1f%% %s\n", img[k].samples * 100.0 / n, img[k].image);
+				m2m_log('I', "PERF", "prof: image %5.1f%% %s\n", img[k].samples * 100.0 / n, img[k].image);
 			}
 		}
 	}
-	rw_print("prof: end\n");
+	m2m_log('I', "PERF", "prof: end\n");
 	free(keys);
 	free(sorted);
 	free(fn);
@@ -1243,7 +1366,7 @@ rw_prof_toggle(void)
 			rw_prof_on = 0;
 			return;
 		}
-		rw_print("prof: sampling every thread every 2 ms until the next com.redwood.metal.prof\n");
+		m2m_log('I', "PERF", "prof: sampling every thread every 2 ms until the next com.redwood.metal.prof\n");
 	} else {
 		rw_prof_on = 0;
 		pthread_join(thread, NULL);
@@ -1270,6 +1393,21 @@ rw_stats_install(void)
 		rw_perf_tick();
 	});
 	dispatch_resume(perf_timer);
+	/*
+	 * The profiler in any Metal process by its own name, com.redwood.metal.prof.<process>: a frame of an
+	 * animation is the app's work (SpringBoard's touch handling and layout) before it is the window
+	 * server's (27 October: backboardd ran 0.13 threads on average while frames came late).
+	 */
+	{
+		char name[96];
+		static int own_prof_token;
+
+		snprintf(name, sizeof(name), "com.redwood.metal.prof.%s", getprogname());
+		notify_register_dispatch(name, &own_prof_token, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(int t) {
+			(void)t;
+			rw_prof_toggle();
+		});
+	}
 	/* only the window server's frames are the screen */
 	if (strcmp(getprogname(), "backboardd") == 0) {
 		notify_register_dispatch("com.redwood.metal.snap", &snap_token,
@@ -1283,7 +1421,7 @@ rw_stats_install(void)
 			rw_dump_fills = 30;
 			rw_dump_images = 6;
 			rw_dump_shapes = 16;
-			rw_print("dump: the next 30 colour fills, 6 image draws and 16 shapes are written out\n");
+			m2m_log('I', "TRACE", "dump: the next 30 colour fills, 6 image draws and 16 shapes are written out\n");
 		});
 		notify_register_dispatch("com.redwood.metal.prof", &prof_token,
 		    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(int t) {
@@ -1294,7 +1432,7 @@ rw_stats_install(void)
 		    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(int t) {
 			(void)t;
 			rw_trace_force = 3;
-			rw_print("trace: the next 3 command buffers are written out draw by draw\n");
+			m2m_log('I', "TRACE", "trace: the next 3 command buffers are written out draw by draw\n");
 		});
 	}
 }
@@ -1307,18 +1445,95 @@ rw_perf_tick(void)
 	typeof(rw_perf) p = rw_perf;
 
 	memset(&rw_perf, 0, sizeof(rw_perf));
+	if (p.commits == 0 && p.compiles == 0) {
+		rw_tex_shapes_used = 0;   /* (a window that drew nothing says nothing, shapes included) */
+		rw_tex_shapes_other = 0;
+	}
 	pthread_mutex_unlock(&rw_stats_lock);
 	if (p.commits == 0 && p.compiles == 0) {
 		return;
 	}
-	rw_print("perf: 5 s: %llu command buffers (%.1f a second), %llu draws; commit %.2f ms each "
+	m2m_log('I', "PERF", "perf: 5 s: %llu command buffers (%.1f a second), %llu draws; commit %.2f ms each "
 	    "(longest %.1f), GPU wait %.2f ms each (longest %.1f), %.0f%% of the 5 s waiting for the "
 	    "GPU; %llu pipelines compiled in %.0f ms (longest %.0f); %llu surface copies, %llu KB in "
-	    "%.1f ms; %llu slow commits\n", p.commits, p.commits / 5.0, p.draws,
+	    "%.1f ms; %llu slow commits; completion %.2f ms each (longest %.1f)\n", p.commits, p.commits / 5.0, p.draws,
 	    p.commits ? p.commit_ns / 1e6 / p.commits : 0.0, p.commit_max / 1e6,
 	    p.commits ? p.wait_ns / 1e6 / p.commits : 0.0, p.wait_max / 1e6, p.wait_ns / 5e9 * 100,
 	    p.compiles, p.compile_ns / 1e6, p.compile_max / 1e6, p.copies, p.copy_bytes / 1024,
-	    p.copy_ns / 1e6, p.slow);
+	    p.copy_ns / 1e6, p.slow, p.completions ? p.completion_ns / 1e6 / p.completions : 0.0, p.completion_max / 1e6);
+	if (p.buf_made || p.buf_freed || p.tex_made || p.tex_freed) {
+		char shapes[400];
+		size_t n = 0;
+
+		m2m_log('I', "PERF", "perf:    allocations: %llu buffers made (%llu KB, %.1f ms in the library), %llu freed; "
+		    "%llu textures made (%.1f ms), %llu freed (lived %.0f ms on average)\n", p.buf_made, p.buf_bytes / 1024,
+		    p.buf_ns / 1e6, p.buf_freed, p.tex_made, p.tex_ns / 1e6, p.tex_freed,
+		    p.tex_freed ? p.tex_life_ns / 1e6 / p.tex_freed : 0.0);
+		/* the five commonest shapes made: type, size, MTLPixelFormat, levels, usage */
+		shapes[0] = '\0';
+		pthread_mutex_lock(&rw_stats_lock);
+		for (unsigned k = 0; k < 5; k++) {
+			unsigned best = ~0u;
+
+			for (unsigned i = 0; i < rw_tex_shapes_used; i++) {
+				if (rw_tex_shapes[i].count != 0 &&
+				    (best == ~0u || rw_tex_shapes[i].count > rw_tex_shapes[best].count)) {
+					best = i;
+				}
+			}
+			if (best == ~0u || n >= sizeof(shapes) - 80) {
+				break;
+			}
+			const struct rwa_texture_shape *t = &rw_tex_shapes[best].shape;
+			n += snprintf(shapes + n, sizeof(shapes) - n, "%s%ux %s %ux%u fmt %u, %u lv, usage 0x%x",
+			    n ? "; " : "", rw_tex_shapes[best].count, rw_texture_type_name(t->type), t->width,
+			    t->height, t->pixel_format, MAX(t->mip_levels, 1u), t->usage);
+			rw_tex_shapes[best].count = 0;
+		}
+		if (rw_tex_shapes_other && n < sizeof(shapes) - 40) {
+			snprintf(shapes + n, sizeof(shapes) - n, "; %u of other shapes", rw_tex_shapes_other);
+		}
+		rw_tex_shapes_used = 0;
+		rw_tex_shapes_other = 0;
+		pthread_mutex_unlock(&rw_stats_lock);
+		if (shapes[0] != '\0') {
+			m2m_log('I', "PERF", "perf:    textures made: %s\n", shapes);
+		}
+	}
+	/* the GPU driver's buffer cache over the window: what the allocations above cost in the kernel */
+	if (mesa.gpu_cache_stats != NULL) {
+		static uint64_t last[6];
+		uint64_t now[6];
+
+		if (mesa.gpu_cache_stats(now) == 0) {
+			uint64_t hits = now[0] - last[0], misses = now[1] - last[1];
+
+			if (hits || misses || now[2] != last[2]) {
+				m2m_log('I', "PERF", "perf:    gpu buffer cache: %llu hits, %llu misses (%.0f%% hit), %llu evicted "
+				    "(%llu KB); holding %llu KB in %llu buffers\n", hits, misses,
+				    hits + misses ? 100.0 * hits / (hits + misses) : 0.0, now[2] - last[2],
+				    (now[3] - last[3]) / 1024, now[4] / 1024, now[5]);
+			}
+			memcpy(last, now, sizeof(last));
+		}
+	}
+	/* constant buffers over the window: a copy is uploaded again at every draw that uses it */
+	if (mesa.ubo_stats != NULL) {
+		static uint64_t last[3];
+		uint64_t now[3];
+
+		if (mesa.ubo_stats(now) == 0 && (now[0] != last[0] || now[1] != last[1])) {
+			m2m_log('I', "PERF", "perf:    constant buffers: %llu bound as they are, %llu copied (%llu KB)\n",
+			    now[0] - last[0], now[1] - last[1], (now[2] - last[2]) / 1024);
+			memcpy(last, now, sizeof(last));
+		}
+	}
+	if (p.draw_calls != 0) {
+		m2m_log('I', "PERF", "perf:    per draw: %.1f us (Gallium %.1f us, %.0f%%), %llu draws\n",
+		    p.draw_ns / 1e3 / p.draw_calls, p.gallium_ns / 1e3 / p.draw_calls,
+		    p.draw_ns ? 100.0 * p.gallium_ns / p.draw_ns : 0.0,
+		    (unsigned long long)p.draw_calls);
+	}
 	/* and what the window was made of (rw_labels_merge), top five by draws */
 	{
 		char top[512];
@@ -1330,7 +1545,7 @@ rw_perf_tick(void)
 		rw_labels_other = 0;
 		pthread_mutex_unlock(&rw_stats_lock);
 		if (top[0] != 0) {
-			rw_print("perf:    %s\n", top);
+			m2m_log('I', "PERF", "perf:    %s\n", top);
 		}
 	}
 }
@@ -1384,7 +1599,7 @@ rw_pass_shape(unsigned count, id const *color, const unsigned *load, const unsig
 	}
 	pthread_mutex_unlock(&rw_stats_lock);
 	if (fresh) {
-		rw_print("pass shape: %s%s\n", [line UTF8String],
+		m2m_log('I', "TRACE", "pass shape: %s%s\n", [line UTF8String],
 		    mixed ? "  <- attachments load differently" : "");
 	}
 }
@@ -1446,16 +1661,12 @@ rw_blend_line(unsigned attachment, unsigned format, const struct rwa_color_blend
 	if ((++*times & (*times - 1)) != 0) {
 		return false;
 	}
-	rw_print("blend: attachment %u format %u blend %u rgb %u/%u op %u alpha %u/%u op %u "
-	         "writeMask 0x%x\n", attachment, format, b->blending_enabled,
+	m2m_log('I', "PSO", "blend: attachment %u format %u blend %u rgb %u/%u op %u alpha %u/%u op %u "
+	         "writeMask 0x%x [pipelines %lu%s]", attachment, format, b->blending_enabled,
 	         b->source_rgb_blend_factor, b->destination_rgb_blend_factor,
 	         b->rgb_blend_operation, b->source_alpha_blend_factor,
-	         b->destination_alpha_blend_factor, b->alpha_blend_operation, b->write_mask);
-	if (*times > 1) {
-		rw_print("  ... and that is the %lu'th pipeline asking for exactly that%s\n",
-		         *times, times == &beyond ? ", counting every configuration past the "
-		                                    "thirty-two this keeps apart" : "");
-	}
+	         b->destination_alpha_blend_factor, b->alpha_blend_operation, b->write_mask, *times,
+	         times == &beyond ? ", every configuration past the thirty-two kept apart" : "");
 	return true;
 }
 
@@ -1486,11 +1697,8 @@ rw_blend_result(unsigned enabled_mask, unsigned write_masks)
 	if ((++*times & (*times - 1)) != 0) {
 		return;
 	}
-	rw_print("blend: the library blends attachments 0x%x and writes 0x%08x (four Gallium "
-	         "bits per attachment, R 0x1 .. A 0x8)\n", enabled_mask, write_masks);
-	if (*times > 1) {
-		rw_print("  ... and that is the %lu'th pipeline it made that of\n", *times);
-	}
+	m2m_log('I', "PSO", "blend: the library blends attachments 0x%x and writes 0x%08x (four Gallium "
+	         "bits per attachment, R 0x1 .. A 0x8) [pipelines %lu]", enabled_mask, write_masks, *times);
 }
 
 /* The private base class. Only what is used of it is declared, and nothing of its layout.
@@ -1621,17 +1829,88 @@ ensure_spi(Class cls)
 	Protocol *spi = objc_getProtocol("MTLDeviceSPI");
 
 	if (spi == NULL) {
-		rw_print("MTLDeviceSPI is not in this process yet; "
+		m2m_log('W', "DEV", "MTLDeviceSPI is not in this process yet; "
 		         "MTLAddDevice would abort\n");
 		return;
 	}
 	if (!class_conformsToProtocol(cls, spi) && !class_addProtocol(cls, spi)) {
-		rw_print("class_addProtocol(MTLDeviceSPI) refused\n");
+		m2m_log('E', "DEV", "class_addProtocol(MTLDeviceSPI) refused\n");
 	}
 	/* and the one method of Metal's OWN function class this driver has to answer: it is
 	 * installed here for the same reason the protocol is declared here, and the whole of
 	 * why it is installed at all is at the end of this file. */
 	ensure_function_encoder();
+}
+
+/*
+ * Which Metal protocol each object class of this driver is, declared in one place.
+ *
+ * Apple's private base classes (_MTLCommandBuffer, _MTLResource, ...) do not adopt the public protocols;
+ * Apple's own drivers declare them on their concrete classes (IOGPUMetalCommandBuffer and the rest), and
+ * Apple's frameworks test them: -[MPSCommandBufferImageCache initWithCommandBuffer:] returns nil for a
+ * buffer that does not conform to MTLCommandBuffer, and MPSAutoCache then dereferences the nil
+ * (PLANS/10-mali2metal.md run 3: "command buffer conforms to MTLCommandBuffer NO" in every process,
+ * mediaserverd dying every 6 s). MTLTextureImplementation is what -[MTLRenderPassColorAttachment
+ * DescriptorInternal setTexture:] (0x181a350a0) tests before a texture may be a render target.
+ *
+ * `declare` rows are added where missing; the others are only looked at, and the one record says how
+ * every pair stands, so that declaring another is a decision made from that record.
+ */
+static void
+rw_declare_protocols(void)
+{
+	static const struct {
+		const char *cls, *protocol;
+		BOOL declare;
+	} table[] = {
+		{ "RedwoodMetalCommandBuffer", "MTLCommandBuffer", YES },
+		{ "RedwoodMetalBuffer", "MTLBuffer", YES },
+		{ "RedwoodMetalTexture", "MTLTexture", YES },
+		{ "RedwoodMetalTexture", "MTLTextureImplementation", YES },
+		{ "RedwoodMetalArgumentEncoder", "MTLArgumentEncoder", YES },
+		{ "RedwoodMetalCommandQueue", "MTLCommandQueue", NO },
+		{ "RedwoodMetalRenderEncoder", "MTLRenderCommandEncoder", NO },
+		{ "RedwoodMetalComputeEncoder", "MTLComputeCommandEncoder", NO },
+		{ "RedwoodMetalBlitEncoder", "MTLBlitCommandEncoder", NO },
+		{ "RedwoodMetalRenderPipeline", "MTLRenderPipelineState", NO },
+		{ "RedwoodMetalComputePipeline", "MTLComputePipelineState", NO },
+		{ "RedwoodMetalSampler", "MTLSamplerState", NO },
+		{ "RedwoodMetalDepthStencilState", "MTLDepthStencilState", NO },
+	};
+	static BOOL done;
+	char added[512] = "", lacking[512] = "", absent[256] = "";
+	size_t na = 0, nl = 0, nb = 0;
+
+	if (done) {
+		return;
+	}
+	done = YES;
+	for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+		Class cls = objc_getClass(table[i].cls);
+		Protocol *p = objc_getProtocol(table[i].protocol);
+
+		if (cls == Nil) {
+			m2m_log('E', "DEV", "protocols: this driver has no class %s", table[i].cls);
+			continue;
+		}
+		if (p == NULL) {
+			/* no image in this process refers to the protocol, so nothing here can test it */
+			nb += (size_t)snprintf(absent + nb, sizeof(absent) - nb, " %s", table[i].protocol);
+			continue;
+		}
+		if (class_conformsToProtocol(cls, p)) {
+			continue;
+		}
+		if (!table[i].declare) {
+			nl += (size_t)snprintf(lacking + nl, sizeof(lacking) - nl, " %s<%s>", table[i].cls + 12, table[i].protocol);
+		} else if (class_addProtocol(cls, p)) {
+			na += (size_t)snprintf(added + na, sizeof(added) - na, " %s<%s>", table[i].cls + 12, table[i].protocol);
+		} else {
+			m2m_log('E', "DEV", "protocols: class_addProtocol(%s, %s) refused", table[i].cls, table[i].protocol);
+		}
+	}
+	m2m_log(nl != 0 ? 'W' : 'I', "DEV", "protocols: declared%s; not declared and not conformed to:%s; "
+	    "not in this process:%s", na ? added : " none", nl ? lacking : " none", nb ? absent : " none");
 }
 
 /* One request of this port's own gpu client, shaped like the msm ioctl it stands for
@@ -1766,6 +2045,11 @@ struct gem_close { uint32_t handle, pad; };
 	RedwoodMetalDevice *_owner;
 	struct rwa_render *_render;
 	struct rwa_render_info _info;
+@public
+	/* the first draw of a pipeline is where Panfrost compiles the variant and makes the
+	 * surfaces it needs: if the slow draws are those, warming them is the fix, and if they
+	 * are spread over a pipeline's life they are hazard flushes instead */
+	uint64_t _draws, _first_ns, _draw_ns;
 }
 - (struct rwa_render *)render;
 /* Not part of any Metal protocol: whether this pipeline's fragment shader stores to
@@ -1975,7 +2259,7 @@ rw_lookup_note(const char *how, id name, id f, id values, NSError *error)
 	}
 	pthread_mutex_unlock(&rw_stats_lock);
 	if (say) {
-		rw_print("function lookup (%s): %s with constants -> %s, %lu B%s%s\n", how,
+		m2m_log('I', "FUNC", "function lookup (%s): %s with constants -> %s, %lu B%s%s\n", how,
 		    [text UTF8String], f == nil ? "NIL" : generic ? "GENERIC module" : "specialised",
 		    (unsigned long)[air length], error != nil ? "; error: " : "",
 		    error != nil ? [[error description] UTF8String] : "");
@@ -2089,7 +2373,7 @@ rw_fc_install(void)
 	    (IMP)rw_lib_descriptor_hook);
 	rw_lib_descriptor_async = (void *)rw_swizzle(library,
 	    @selector(newFunctionWithDescriptor:completionHandler:), (IMP)rw_lib_descriptor_async_hook);
-	rw_print("function constants: read from %s (%s%s), recorded by its setters (%s%s%s%s), "
+	m2m_log('I', "FUNC", "function constants: read from %s (%s%s), recorded by its setters (%s%s%s%s), "
 	    "functions tied by %s (%s%s%s%s%s%s)\n", values != Nil ? class_getName(values) : "nothing",
 	    values != Nil && class_getInstanceMethod(values, sel_getUid("newNamedConstantArray"))
 		? "named " : "", values != Nil &&
@@ -2263,7 +2547,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 			[said addObject:sig];
 			per_name[name] = @([seen unsignedIntValue] + 1);
 			lines++;
-			rw_print("function constants: %s: %u value%s from %s (%s, a %s);%s\n",
+			m2m_log('I', "FUNC", "function constants: %s: %u value%s from %s (%s, a %s);%s\n",
 			    [name UTF8String], n, n == 1 ? "" : "s", from,
 			    values != nil ? how : "no constant-values object",
 			    class_getName(object_getClass(function)),
@@ -2290,6 +2574,8 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	char *note;              /* (rwm_trace) what a blit does, in words */
 	unsigned pass;           /* (rwm_trace) which render pass recorded it */
 	unsigned level, slice, loadAction, storeAction;   /* attachment 0's */
+	unsigned colorLevel[8], colorSlice[8];            /* every attachment's level and slice */
+	unsigned depthLevel, depthSlice;
 	unsigned scissor[4];     /* -setScissorRect: at the draw, if hasScissor */
 	BOOL hasScissor;
 	float viewport[4];       /* -setViewport:'s rectangle at the draw, if hasViewport */
@@ -2333,6 +2619,161 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 - (void)redwoodRetainReferences;
 @end
 
+/* The calling thread's current and base scheduling priority (THREAD_EXTENDED_INFO), -1 if unknown */
+static void
+rw_thread_priority(int *cur, int *base)
+{
+	struct thread_extended_info info;
+	mach_msg_type_number_t count = THREAD_EXTENDED_INFO_COUNT;
+	thread_t self = mach_thread_self();
+
+	*cur = *base = -1;
+	if (thread_info(self, THREAD_EXTENDED_INFO, (thread_info_t)&info, &count) == KERN_SUCCESS) {
+		*cur = info.pth_curpri;
+		*base = info.pth_priority;
+	}
+	mach_port_deallocate(mach_task_self(), self);
+}
+
+/* The machine's processor ticks by state, summed over every CPU (HOST_CPU_LOAD_INFO); false if unknown */
+static bool
+rw_cpu_ticks(host_cpu_load_info_data_t *out)
+{
+	mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
+	static mach_port_t host;
+
+	if (host == MACH_PORT_NULL) {
+		host = mach_host_self();
+	}
+	return host_statistics(host, HOST_CPU_LOAD_INFO, (host_info_t)out, &count) == KERN_SUCCESS;
+}
+
+/* The process's scheduling standing, for a record: the task role RunningBoard gave it
+ * (TASK_CATEGORY_POLICY; -1 unknown) and whether it is darwinbg (getpriority(PRIO_DARWIN_PROCESS)) */
+static void
+rw_task_standing(int *role, int *darwinbg)
+{
+	struct task_category_policy category;
+	mach_msg_type_number_t count = TASK_CATEGORY_POLICY_COUNT;
+	boolean_t get_default = FALSE;
+
+	*role = -1;
+	if (task_policy_get(mach_task_self(), TASK_CATEGORY_POLICY, (task_policy_t)&category, &count,
+			    &get_default) == KERN_SUCCESS) {
+		*role = category.role;
+	}
+	*darwinbg = getpriority(PRIO_DARWIN_PROCESS, 0);
+}
+
+/* True the first time this process passes `name` (a function's name), for once-per-name records;
+ * past 256 names, false. */
+static bool
+rw_first_name(const char *name)
+{
+	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+	static uint64_t seen[256];
+	static unsigned nseen;
+	uint64_t h = 1469598103934665603ull;
+	bool fresh = true;
+
+	for (const char *p = name ? name : ""; *p; p++) {
+		h = (h ^ (uint8_t)*p) * 1099511628211ull;
+	}
+	pthread_mutex_lock(&lock);
+	for (unsigned i = 0; i < nseen; i++) {
+		if (seen[i] == h) {
+			fresh = false;
+			break;
+		}
+	}
+	if (fresh) {
+		if (nseen < sizeof(seen) / sizeof(seen[0])) {
+			seen[nseen++] = h;
+		} else {
+			fresh = false;
+		}
+	}
+	pthread_mutex_unlock(&lock);
+	return fresh;
+}
+
+/* "0,2" for a slot mask (a per-thread buffer: one record at a time) */
+static const char *
+rw_slot_list(uint32_t mask)
+{
+	static __thread char buf[96];
+	size_t n = 0;
+
+	buf[0] = '\0';
+	for (unsigned i = 0; i < 32 && n < sizeof(buf) - 4; i++) {
+		if (mask & (1u << i)) {
+			n += snprintf(buf + n, sizeof(buf) - n, "%s%u", n ? "," : "", i);
+		}
+	}
+	return buf;
+}
+
+/* MTLTextureType's names, for records */
+static const char *
+rw_texture_type_name(unsigned type)
+{
+	static const char *names[] = { "1D", "1DArray", "2D", "2DArray", "2DMultisample", "Cube",
+				       "CubeArray", "3D", "2DMultisampleArray", "TextureBuffer" };
+
+	return type < sizeof(names) / sizeof(names[0]) ? names[type] : "type?";
+}
+
+/* Metal's slice count of a texture: the faces of a cube are slices (6 a cube) */
+static unsigned
+rw_texture_slices(const struct rwa_texture_shape *shape)
+{
+	unsigned array = MAX(shape->array_length, 1u);
+
+	switch (shape->type) {
+	case 1: case 3: case 8: return array;      /* 1DArray, 2DArray, 2DMultisampleArray */
+	case 5: return 6;                         /* Cube */
+	case 6: return 6 * array;                 /* CubeArray */
+	default: return 1;
+	}
+}
+
+/* One I RES record per distinct view shape a process makes (what is viewed as what), so the
+ * channel says which of Metal's view casts the system actually uses. */
+static void
+rw_note_view(const struct rwa_texture_shape *from, NSUInteger format, NSUInteger type, NSRange levels,
+	     NSRange slices)
+{
+	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+	static uint64_t seen[32];
+	static unsigned nseen;
+	uint64_t key = (uint64_t)from->pixel_format << 40 | (uint64_t)from->type << 32 |
+		       (uint64_t)(format & 0xffff) << 16 | (uint64_t)(type & 0xff) << 8 |
+		       (levels.location ? 1 : 0) << 1 | (slices.location ? 1 : 0);
+	bool fresh = true;
+
+	pthread_mutex_lock(&lock);
+	for (unsigned i = 0; i < nseen; i++) {
+		if (seen[i] == key) {
+			fresh = false;
+			break;
+		}
+	}
+	if (fresh && nseen < sizeof(seen) / sizeof(seen[0])) {
+		seen[nseen++] = key;
+	} else if (fresh) {
+		fresh = false;   /* past 32 shapes: the first 32 were said */
+	}
+	pthread_mutex_unlock(&lock);
+	if (fresh) {
+		m2m_log('I', "RES", "texture view: %s %ux%u format %u (%u levels, %u slices) as %s format %lu, "
+			"levels %lu+%lu, slices %lu+%lu", rw_texture_type_name(from->type), from->width,
+			from->height, from->pixel_format, MAX(from->mip_levels, 1u), rw_texture_slices(from),
+			rw_texture_type_name((unsigned)type), (unsigned long)format,
+			(unsigned long)levels.location, (unsigned long)levels.length,
+			(unsigned long)slices.location, (unsigned long)slices.length);
+	}
+}
+
 @interface RedwoodMetalTexture : _MTLResource {
 	RedwoodMetalDevice *_owner;
 	struct rwa_texture *_texture;
@@ -2343,8 +2784,23 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	BOOL _copied;              /* a COPY of _iosurface, refreshed when its seed moves */
 	uint32_t _copySeed;
 	BOOL _copiedOnce;
+	RedwoodMetalTexture *_parent;   /* a view: the texture whose memory it shows (retained) */
+	NSUInteger _parentLevel, _parentSlice;
+	uint64_t _countedAt;            /* made by -newTextureWithDescriptor: and counted (rw_perf) */
+	id _buffer;                     /* a texture over a buffer's memory: that buffer (retained) */
+	NSUInteger _bufferOffset, _bufferBytesPerRow;
 }
 @property (readonly) struct rwa_texture *mesaTexture;
+/* counted in rw_perf's allocations, made at `t` (its free is counted with its lifetime) */
+- (void)redwoodCountedAt:(uint64_t)t;
+/* laid over `buffer`'s memory from `offset`, `bytesPerRow` a row (rwa_texture_from_buffer) */
+- (void)redwoodSetBuffer:(id)buffer offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bytesPerRow;
+/* a view (rwa_texture_view) of `parent`, at its level and slice */
+- (instancetype)initWithRedwoodParent:(RedwoodMetalTexture *)parent
+			      texture:(struct rwa_texture *)texture
+				shape:(const struct rwa_texture_shape *)shape
+				level:(NSUInteger)level
+				slice:(NSUInteger)slice;
 - (void)redwoodSetIOSurface:(void *)surface plane:(NSUInteger)plane;
 /* serve _iosurface by copying it in (a row length the GPU cannot import in place) */
 - (void)redwoodCopySurface;
@@ -2414,6 +2870,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 + (void)load
 {
 	ensure_spi(self);
+	rw_declare_protocols();
 }
 
 - (instancetype)initWithAcceleratorPort:(io_service_t)port
@@ -2443,11 +2900,15 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	}
 	_gpu = IO_OBJECT_NULL;
 	if (gpu == IO_OBJECT_NULL) {
-		rw_print("no RedwoodGPU or RedwoodMali service (the gpu was not started)\n");
+		m2m_log('E', "DEV", "no RedwoodGPU or RedwoodMali service (the gpu was not started)\n");
 	} else {
 		kern_return_t kr = IOServiceOpen(gpu, mach_task_self(), 0, &_gpu);
 
-		rw_print("%s client %s (%#x)\n", service,
+		/* a Metal client from here: the kernel reports how this process ends (F CRASH), and the
+		 * crash recorder says where, unless the process handles those signals itself (m2m.h) */
+		m2m_client("metal");
+		m2m_watch_crashes();
+		m2m_log(kr == KERN_SUCCESS ? 'I' : 'E', "DEV", "%s client %s (%#x)\n", service,
 		         kr == KERN_SUCCESS ? "opened" : "refused", kr);
 		IOObjectRelease(gpu);
 	}
@@ -2458,7 +2919,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 		char why[256] = { 0 };
 
 		_mesa = mesa.device_open(why, sizeof(why));
-		rw_print("the compiler library %s\n",
+		m2m_log('I', "DEV", "the compiler library %s\n",
 		         _mesa != NULL ? mesa.device_name(_mesa) : why);
 	}
 
@@ -2478,7 +2939,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	_target.target = 0;
 	_target.version = 0;
 	_target.name = _targetName;
-	rw_print("targetDeviceInfo answers {0, 0, \"%s\"} -- _MTLDevice's own entry "
+	m2m_log('I', "DEV", "targetDeviceInfo answers {0, 0, \"%s\"} -- _MTLDevice's own entry "
 	         "answers NULL and Metal reads it without looking, so the precompiled pipelines "
 	         "this device will be asked for are pipelines.%s\n", _target.name, _target.name);
 	return self;
@@ -2544,7 +3005,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 		    (at = strstr(args, "metal_profile=")) != NULL && (at == args || at[-1] == ' ')) {
 			profile = (NSUInteger)strtoul(at + strlen("metal_profile="), NULL, 10);
 		}
-		rw_print("feature profile %lu, which is what Metal reads this device's "
+		m2m_log('I', "DEV", "feature profile %lu, which is what Metal reads this device's "
 		         "whole capability surface out of (metal_profile= to change it; 0 claims Apple1 "
 		         "alone, 1 adds Apple2, which is the lowest rung MPS asks about)\n",
 		         (unsigned long)profile);
@@ -2710,7 +3171,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	if (blend_is_new) {
 		NSString *label = [descriptor label];
 
-		rw_print("blend: ... and the first such pipeline's label is %s\n",
+		m2m_log('I', "PSO", "blend: ... and the first such pipeline's label is %s\n",
 		         label != nil ? [label UTF8String] : "(none)");
 	}
 	/* Both aspect formats, as Metal's descriptor has them, and the library requires
@@ -2837,7 +3298,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 		}
 		pthread_mutex_unlock(&rw_stats_lock);
 		if (say) {
-			rw_print("pipeline %u: %s | vs %s %lu B%s | fs %s %lu B%s | %s%s | %.1f ms\n", number,
+			m2m_log('I', "PSO", "pipeline %u: %s | vs %s %lu B%s | fs %s %lu B%s | %s%s | %.1f ms\n", number,
 			    label != nil ? [label UTF8String] : "(no label)",
 			    vertex != nil ? [[vertex name] UTF8String] : "(generated)",
 			    (unsigned long)[vertex_air length], vgen ? " GENERIC" : "",
@@ -2856,7 +3317,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 		 * "refused by name" discipline unobservable from a boot: one pipeline
 		 * specification was declined 80 times over 42 lives of backboardd before the
 		 * vertex layout existed, and that number had to be counted by hand. */
-		RW_AGAIN("this render pipeline is refused: %s\n", why);
+		RW_AGAIN('E', "PSO", "this render pipeline is refused: %s\n", why);
 		return [self fail:error with:[NSString stringWithUTF8String:why]];
 	}
 	/* and what the library made of it, in GALLIUM's bits: for any mask but All, None,
@@ -2996,7 +3457,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 {
 	(void)descriptor;
 	(void)backed;
-	RW_ONCE("redwoodmetal: a texture layout was asked for and this driver has none to give; "
+	RW_ONCE('W', "RES", "a texture layout was asked for and this driver has none to give; "
 		"CoreAnimation sizes a surface with it before any texture exists, and nil is the "
 		"answer until a boot says nil is not tolerated\n");
 	return nil;
@@ -3050,7 +3511,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	(void)length;
 	(void)descriptor;
 	(void)deallocator;
-	RW_ONCE("redwoodmetal: a texture over the caller's own memory was asked for, and the "
+	RW_ONCE('W', "RES", "a texture over the caller's own memory was asked for, and the "
 		"contract has no import for a bare pointer -- only for an IOSurface. Copying "
 		"instead would be worse than nil: the caller writes to its pages and expects the "
 		"texture to follow\n");
@@ -3062,7 +3523,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	char why[256] = { 0 };
 
 	if (_mesa == NULL) {
-		rw_print("a texture needs the compiler library\n");
+		m2m_log('E', "RES", "a texture needs the compiler library\n");
 		return nil;
 	}
 	struct rwa_texture_shape shape = {
@@ -3076,27 +3537,33 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 		.sample_count = (unsigned)[descriptor sampleCount],
 		.usage = (unsigned)[descriptor usage],
 	};
+	uint64_t t_made = rw_now_ns();
 	struct rwa_texture *texture = mesa.texture_create(_mesa, &shape, why, sizeof(why));
 
 	if (texture == NULL) {
-		rw_print("%s\n", why);
+		m2m_log('E', "RES", "%s\n", why);
 		return nil;
 	}
-	return [[RedwoodMetalTexture alloc] initWithRedwoodDevice:self
-							 texture:texture
-							   shape:&shape];
+	rw_note_alloc(&shape, 0, rw_now_ns() - t_made);
+	RedwoodMetalTexture *made = [[RedwoodMetalTexture alloc] initWithRedwoodDevice:self
+									       texture:texture
+										 shape:&shape];
+	[made redwoodCountedAt:t_made];
+	return made;
 }
 
 /* The sampler's own base class exists and owes its protocol nothing, so this is the cheapest
  * object in the driver: the state goes to the compiler library, which maps it the same way it
  * maps a shader's own `constexpr sampler` word -- one vocabulary, so the two can be checked
  * against each other (docs/air.md 3.3). */
+#define RW_FILTER_CUBIC 2u     /* MTLSamplerMinMagFilterCubic: private, not in the SDK's header */
+
 - (id)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)descriptor
 {
 	char why[256] = { 0 };
 
 	if (_mesa == NULL) {
-		rw_print("a sampler needs the compiler library\n");
+		m2m_log('E', "RES", "a sampler needs the compiler library\n");
 		return nil;
 	}
 	struct rwa_sampler_state state = {
@@ -3112,10 +3579,22 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 		.lod_min = [descriptor lodMinClamp],
 		.lod_max = [descriptor lodMaxClamp],
 	};
+	/*
+	 * 2 is Apple's private MTLSamplerMinMagFilterCubic (Metal's own enumeration names, in value
+	 * order: Nearest, Linear, Cubic), which MPS asks for in mediaserverd. The Mali has no bicubic
+	 * filtering and Gallium no such filter, so it is served as linear and said: a softer picture
+	 * where Apple's GPU would have been sharper, instead of no sampler at all.
+	 */
+	if (state.min_filter == RW_FILTER_CUBIC || state.mag_filter == RW_FILTER_CUBIC) {
+		RW_AGAIN('W', "RES", "a sampler asks for bicubic filtering (MTLSamplerMinMagFilterCubic, min %u mag %u), "
+			 "which the Mali does not have: served as linear\n", state.min_filter, state.mag_filter);
+		state.min_filter = state.min_filter == RW_FILTER_CUBIC ? MTLSamplerMinMagFilterLinear : state.min_filter;
+		state.mag_filter = state.mag_filter == RW_FILTER_CUBIC ? MTLSamplerMinMagFilterLinear : state.mag_filter;
+	}
 	struct rwa_sampler *sampler = mesa.sampler_create(_mesa, &state, why, sizeof(why));
 
 	if (sampler == NULL) {
-		rw_print("%s\n", why);
+		m2m_log('E', "RES", "%s\n", why);
 		return nil;
 	}
 	return [[RedwoodMetalSampler alloc] initWithRedwoodDevice:self
@@ -3140,15 +3619,15 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	char why[256] = { 0 };
 
 	if (descriptor == nil) {
-		rw_print("a depth/stencil state needs a descriptor\n");
+		m2m_log('E', "RES", "a depth/stencil state needs a descriptor\n");
 		return nil;
 	}
 	if (_mesa == NULL) {
-		rw_print("a depth/stencil state needs the compiler library\n");
+		m2m_log('E', "RES", "a depth/stencil state needs the compiler library\n");
 		return nil;
 	}
 	if (mesa.depth_stencil_create == NULL) {
-		rw_print("this compiler library has no depth/stencil state, so it "
+		m2m_log('W', "RES", "this compiler library has no depth/stencil state, so it "
 		         "is older than this driver and cannot test depth\n");
 		return nil;
 	}
@@ -3188,7 +3667,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 								   sizeof(why));
 
 	if (made == NULL) {
-		rw_print("%s\n", why);
+		m2m_log('E', "RES", "%s\n", why);
 		return nil;
 	}
 	return [[RedwoodMetalDepthStencilState alloc] initWithRedwoodDevice:self
@@ -3228,12 +3707,12 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	NSUInteger count = [arguments count];
 
 	if (mesa.argbuf_encode_buffer == NULL || mesa.module_argbufs == NULL) {
-		rw_print("this compiler library has no argument buffers in it, so "
+		m2m_log('W', "ENC", "this compiler library has no argument buffers in it, so "
 		         "an encoder would record what no draw could read\n");
 		return nil;
 	}
 	if (count == 0 || count > RWA_MAX_ARGBUF_MEMBERS) {
-		rw_print("an argument encoder of %lu members: this driver records "
+		m2m_log('I', "ENC", "an argument encoder of %lu members: this driver records "
 		         "1 to %u\n", (unsigned long)count, RWA_MAX_ARGBUF_MEMBERS);
 		return nil;
 	}
@@ -3255,7 +3734,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 		case MTLDataTypeTexture: kind = RWA_ARGBUF_TEXTURE; break;
 		case MTLDataTypeSampler: kind = RWA_ARGBUF_SAMPLER; break;
 		default:
-			rw_print("member %lu of this argument encoder is "
+			m2m_log('W', "ENC", "member %lu of this argument encoder is "
 			         "MTLDataType %lu, and this port binds a buffer, a texture or a "
 			         "sampler member: a value inside a set is refused when the "
 			         "shader is translated\n", (unsigned long)index,
@@ -3263,14 +3742,14 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 			return nil;
 		}
 		if (array > 1) {
-			rw_print("member %lu of this argument encoder is an array "
+			m2m_log('W', "ENC", "member %lu of this argument encoder is an array "
 			         "of %lu descriptors, and this port's frontend refuses a member "
 			         "spanning more than one descriptor index\n",
 			         (unsigned long)index, (unsigned long)array);
 			return nil;
 		}
 		if (index >= count || (seen & (1ull << index)) != 0) {
-			rw_print("this argument encoder has %lu members and one of "
+			m2m_log('W', "ENC", "this argument encoder has %lu members and one of "
 			         "them is index %lu: Metal's encodedLength is over the highest "
 			         "index, so this driver will not answer a length for indices "
 			         "with a gap or a repeat in them\n", (unsigned long)count,
@@ -3296,7 +3775,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 - (id)newArgumentEncoderWithBufferBinding:(id)binding
 {
 	(void)binding;
-	rw_print("-newArgumentEncoderWithBufferBinding: takes a reflection "
+	m2m_log('W', "ENC", "-newArgumentEncoderWithBufferBinding: takes a reflection "
 	         "object, and reflection on this port needs Metal's own compiler, which is "
 	         "nil; ask a function for an encoder (-newArgumentEncoderWithBufferIndex:) or "
 	         "describe the set with MTLArgumentDescriptors\n");
@@ -3317,19 +3796,19 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 		bitcode = sel_getUid("bitcodeData");
 	}
 	if (_mesa == NULL || mesa.module_argbufs == NULL) {
-		rw_print("no compiler library, so the argument buffer layout of "
+		m2m_log('E', "ENC", "no compiler library, so the argument buffer layout of "
 		         "this function cannot be read\n");
 		return nil;
 	}
 	if (function == nil || ![function respondsToSelector:bitcode]) {
-		rw_print("this function does not answer bitcodeData, so its "
+		m2m_log('W', "ENC", "this function does not answer bitcodeData, so its "
 		         "argument buffers cannot be read\n");
 		return nil;
 	}
 	NSData *air = ((NSData *(*)(id, SEL))objc_msgSend)(function, bitcode);
 
 	if (air == nil || [air length] == 0) {
-		rw_print("this function has no bitcode\n");
+		m2m_log('W', "ENC", "this function has no bitcode\n");
 		return nil;
 	}
 
@@ -3342,7 +3821,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 				(unsigned)(sizeof(sets) / sizeof(sets[0])), &count, why,
 				sizeof(why)) != 0) {
 		/* the frontend's own sentence, passed through: it names what it refused */
-		rw_print("%s\n", why);
+		m2m_log('E', "ENC", "%s\n", why);
 		return nil;
 	}
 	for (unsigned i = 0; i < count; i++) {
@@ -3364,7 +3843,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 		snprintf(one, sizeof(one), "%s%u", i ? ", " : " at ", sets[i].metal_index);
 		strlcat(which, one, sizeof(which));
 	}
-	rw_print("bufferIndex %lu does not identify an argument buffer: this function "
+	m2m_log('W', "ENC", "bufferIndex %lu does not identify an argument buffer: this function "
 	         "declares %u%s\n", (unsigned long)index, count, which);
 	return nil;
 }
@@ -3500,7 +3979,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 		rw_count(&rw_refusals, [NSString stringWithFormat:@"(compute %@) %s",
 		    [function name], why]);
 		pthread_mutex_unlock(&rw_stats_lock);
-		RW_AGAIN("this compute pipeline is refused: %s: %s\n", [[function name] UTF8String],
+		RW_AGAIN('E', "PSO", "this compute pipeline is refused: %s: %s\n", [[function name] UTF8String],
 		    why);
 		/* The front end's own sentence, passed through rather than replaced: it says
 		 * which construct it refused, and an application can act on that. */
@@ -3509,6 +3988,12 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	pthread_mutex_lock(&rw_stats_lock);
 	rw_stats.compute_ok++;
 	pthread_mutex_unlock(&rw_stats_lock);
+	if (rw_first_name([[function name] UTF8String])) {
+		m2m_log('I', "PSO", "compute pipeline made: %s (%u buffers, %u textures, %u samplers%s%s)",
+			[[function name] UTF8String], info.buffers, info.textures, info.samplers,
+			info.null_query_textures ? "; asks is_null_texture about slots " : "",
+			info.null_query_textures ? rw_slot_list(info.null_query_textures) : "");
+	}
 	return [[RedwoodMetalComputePipeline alloc] initWithRedwoodDevice:self
 								 compute:compute
 								    info:&info
@@ -3696,7 +4181,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	struct rwa_texture *texture;
 
 	if (_mesa == NULL) {
-		rw_print("a drawable's texture needs the compiler library\n");
+		m2m_log('E', "SURF", "a drawable's texture needs the compiler library\n");
 		return nil;
 	}
 	memset(&shape, 0, sizeof(shape));
@@ -3719,11 +4204,11 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 		struct rwa_texture *own = mesa.texture_create(_mesa, &shape, why2, sizeof(why2));
 
 		if (own == NULL) {
-			RW_AGAIN("no drawable: surface %u (%u bytes a row) could not be copied: %s\n",
+			RW_AGAIN('E', "SURF", "no drawable: surface %u (%u bytes a row) could not be copied: %s\n",
 			    took.surface, took.rowBytes, why2);
 			return nil;
 		}
-		RW_AGAIN("surface %u is %ux%u at %u bytes a row, which the GPU cannot import in "
+		RW_AGAIN('W', "SURF", "surface %u is %ux%u at %u bytes a row, which the GPU cannot import in "
 		    "place; it is served as a copy, refreshed when the surface changes\n",
 		    took.surface, took.width, took.height, took.rowBytes);
 		RedwoodMetalTexture *copy = [[RedwoodMetalTexture alloc] initWithRedwoodDevice:self
@@ -3734,7 +4219,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 		return copy;
 	}
 	if (texture == NULL) {
-		RW_AGAIN("no drawable: %s\n", why);
+		RW_AGAIN('E', "SURF", "no drawable: %s\n", why);
 		return nil;
 	}
 	RedwoodMetalTexture *made = [[RedwoodMetalTexture alloc] initWithRedwoodDevice:self
@@ -3912,7 +4397,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	if (_target.name == NULL) {
 		_target.name = _targetName;
 	}
-	RW_ONCE("Metal asked for targetDeviceInfo (pipelines.%s); it is answered "
+	RW_ONCE('I', "DEV", "Metal asked for targetDeviceInfo (pipelines.%s); it is answered "
 		"with a real struct because Apple's own answer here is a NULL this driver does "
 		"not get to decline\n", _target.name);
 	return &_target;
@@ -3947,15 +4432,6 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 
 @implementation RedwoodMetalBuffer
 
-+ (void)load
-{
-	Protocol *p = objc_getProtocol("MTLBuffer");
-
-	if (p != NULL && !class_conformsToProtocol(self, p) && !class_addProtocol(self, p)) {
-		rw_print("class_addProtocol(MTLBuffer) refused\n");
-	}
-}
-
 - (instancetype)initWithDevice:(RedwoodMetalDevice *)device
 			   gpu:(io_connect_t)gpu
 			length:(NSUInteger)length
@@ -3975,9 +4451,14 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	if (mesa_available() && [device mesaDevice] != NULL) {
 		char why[256] = { 0 };
 
+		uint64_t t_made = rw_now_ns();
+
 		_mesa = mesa.buffer_create([device mesaDevice], length, why, sizeof(why));
+		if (_mesa != NULL) {
+			rw_note_alloc(NULL, length, rw_now_ns() - t_made);
+		}
 		if (_mesa == NULL) {
-			rw_print("Mesa would not allocate %lu bytes: %s\n",
+			m2m_log('E', "RES", "Mesa would not allocate %lu bytes: %s\n",
 			         (unsigned long)length, why);
 			[self release];
 			return nil;
@@ -3988,7 +4469,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 		return self;
 	}
 	if (gpu == IO_OBJECT_NULL || length == 0) {
-		rw_print("a buffer of %lu bytes needs a gpu client\n",
+		m2m_log('E', "RES", "a buffer of %lu bytes needs a gpu client\n",
 		         (unsigned long)length);
 		[self release];
 		return nil;
@@ -4006,7 +4487,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 		if (length > UINT32_MAX ||
 		    IOConnectCallStructMethod(gpu, 0x42, &bo, sizeof(bo), &bo, &bo_size) != KERN_SUCCESS ||
 		    bo.handle == 0) {
-			rw_print("the kernel would not allocate %lu bytes\n", (unsigned long)length);
+			m2m_log('E', "RES", "the kernel would not allocate %lu bytes\n", (unsigned long)length);
 			[self release];
 			return nil;
 		}
@@ -4019,13 +4500,13 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 					 kIOMapAnywhere) == KERN_SUCCESS) {
 			_contents = (void *)(uintptr_t)address;
 		} else {
-			rw_print("buffer %u is allocated but could not be mapped\n", _handle);
+			m2m_log('E', "RES", "buffer %u is allocated but could not be mapped\n", _handle);
 		}
 		return self;
 	}
 	if (IOConnectCallStructMethod(gpu, kMsmGemNew, &request, sizeof(request), &request,
 				      &size) != KERN_SUCCESS || request.handle == 0) {
-		rw_print("the kernel would not allocate %lu bytes\n",
+		m2m_log('E', "RES", "the kernel would not allocate %lu bytes\n",
 		         (unsigned long)length);
 		[self release];
 		return nil;
@@ -4053,7 +4534,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 				 kIOMapAnywhere) == KERN_SUCCESS) {
 		_contents = (void *)(uintptr_t)address;
 	} else {
-		rw_print("buffer %u is allocated but could not be mapped\n", _handle);
+		m2m_log('E', "RES", "buffer %u is allocated but could not be mapped\n", _handle);
 	}
 	return self;
 }
@@ -4067,6 +4548,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 {
 	if (_mesa != NULL) {
 		mesa.buffer_destroy(_mesa);
+		rw_note_free(false, 0);
 		[super dealloc];
 		return;
 	}
@@ -4157,18 +4639,47 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 }
 - (void)setResponsibleProcess:(int)pid { _responsibleProcess = pid; }
 /*
- * A texture laid over this buffer's memory. Textures exist now -- the comment here used to say
- * they did not -- but the contract still has no call that lays one over a buffer we already own,
- * so this is nil with a reason rather than nil with a stale excuse.
+ * A texture laid over this buffer's memory (rwa_texture_from_buffer): one GPU buffer object for both, so
+ * what is written through either is what the other reads. chronod's widgets ask for one, and a nil here
+ * left part of a widget undrawn (PLANS/10-mali2metal.md, run 29).
  */
 - (id)newTextureWithDescriptor:(id)descriptor offset:(NSUInteger)offset
 		   bytesPerRow:(NSUInteger)bytesPerRow
 {
-	(void)descriptor; (void)offset; (void)bytesPerRow;
-	RW_ONCE("redwoodmetal: a texture over a buffer was asked for; the contract lays a texture "
-		"over an IOSurface and over memory of its own, but not over a buffer this driver "
-		"already holds\n");
-	return nil;
+	char why[256] = "the buffer's memory is the kernel's own, not the compiler library's";
+	struct rwa_texture_shape shape = {
+		.pixel_format = (unsigned)[descriptor pixelFormat],
+		.type = (unsigned)[descriptor textureType],
+		.width = (unsigned)[descriptor width],
+		.height = (unsigned)[descriptor height],
+		.depth = (unsigned)[descriptor depth],
+		.array_length = (unsigned)[descriptor arrayLength],
+		.mip_levels = (unsigned)[descriptor mipmapLevelCount],
+		.sample_count = (unsigned)[descriptor sampleCount],
+		.usage = (unsigned)[descriptor usage],
+	};
+	struct rwa_texture *texture = NULL;
+
+	if (_mesa != NULL && mesa.texture_from_buffer == NULL) {
+		strlcpy(why, "the compiler library has no rwa_texture_from_buffer", sizeof(why));
+	}
+	if (_mesa != NULL && mesa.texture_from_buffer != NULL) {
+		texture = mesa.texture_from_buffer(_mesa, &shape, offset, bytesPerRow, why, sizeof(why));
+	}
+	if (texture == NULL) {
+		RW_AGAIN('E', "RES", "texture over a buffer of %lu bytes: %s %ux%u format %u usage %#x at offset %lu, %lu bytes a "
+		    "row: %s; nil\n", (unsigned long)_length, rw_texture_type_name(shape.type), shape.width, shape.height,
+		    shape.pixel_format, shape.usage, (unsigned long)offset, (unsigned long)bytesPerRow, why);
+		return nil;
+	}
+	RW_ONCE('I', "RES", "texture over a buffer made (first: %s %ux%u format %u usage %#x at offset %lu, %lu bytes a row, "
+	    "the buffer's own memory)\n", rw_texture_type_name(shape.type), shape.width, shape.height, shape.pixel_format,
+	    shape.usage, (unsigned long)offset, (unsigned long)bytesPerRow);
+
+	RedwoodMetalTexture *made = [[RedwoodMetalTexture alloc] initWithRedwoodDevice:_owner texture:texture
+										 shape:&shape];
+	[made redwoodSetBuffer:self offset:offset bytesPerRow:bytesPerRow];
+	return made;
 }
 
 - (id)newLinearTextureWithDescriptor:(id)descriptor offset:(NSUInteger)offset
@@ -4185,27 +4696,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 
 @implementation RedwoodMetalTexture
 
-+ (void)load
-{
-	/* MTLTexture is what an application sees. MTLTextureImplementation is what Metal
-	 * itself checks: -[MTLRenderPassColorAttachmentDescriptorInternal setTexture:]
-	 * (0x181a350a0) asks conformsToProtocol: for it and reports "texture is not a
-	 * MTLTextureImplementation." Only the conformance is tested on that path -- nothing
-	 * sends its 68 members -- so declaring it is honest and is what lets a texture of ours
-	 * be a render target at all. */
-	const char *names[] = { "MTLTexture", "MTLTextureImplementation" };
-
-	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-		Protocol *p = objc_getProtocol(names[i]);
-
-		if (p == NULL) {
-			continue;
-		}
-		if (!class_conformsToProtocol(self, p) && !class_addProtocol(self, p)) {
-			rw_print("class_addProtocol(%s) refused\n", names[i]);
-		}
-	}
-}
+/* (its MTLTexture and MTLTextureImplementation conformance is declared with the others: rw_declare_protocols) */
 
 - (instancetype)initWithRedwoodDevice:(RedwoodMetalDevice *)device
 			      texture:(struct rwa_texture *)texture
@@ -4222,21 +4713,56 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	return self;
 }
 
+- (instancetype)initWithRedwoodParent:(RedwoodMetalTexture *)parent
+			      texture:(struct rwa_texture *)texture
+				shape:(const struct rwa_texture_shape *)shape
+				level:(NSUInteger)level
+				slice:(NSUInteger)slice
+{
+	self = [self initWithRedwoodDevice:[parent device] texture:texture shape:shape];
+	if (self == nil) {
+		return nil;
+	}
+	_parent = [parent retain];
+	_parentLevel = level;
+	_parentSlice = slice;
+	return self;
+}
+
 - (void)dealloc
 {
 	if (_texture != NULL) {
 		mesa.texture_destroy(_texture);
+		if (_countedAt != 0) {
+			rw_note_free(true, rw_now_ns() - _countedAt);
+		}
 	}
 	if (_iosurface != NULL) {
 		CFRelease(_iosurface);
 	}
+	[_parent release];
+	[_buffer release];
 	[super dealloc];
+}
+
+- (void)redwoodCountedAt:(uint64_t)t { _countedAt = t; }
+
+- (void)redwoodSetBuffer:(id)buffer offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bytesPerRow
+{
+	[_buffer release];
+	_buffer = [buffer retain];
+	_bufferOffset = offset;
+	_bufferBytesPerRow = bytesPerRow;
 }
 
 - (struct rwa_texture *)mesaTexture
 {
 	if (_copied) {
 		[self redwoodRefreshCopy];
+	}
+	/* a view of a copied surface shows the copy, so the copy is brought up to date first */
+	if (_parent != nil) {
+		(void)[_parent mesaTexture];
 	}
 	return _texture;
 }
@@ -4283,7 +4809,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 		return;
 	}
 	if (lock(_iosurface, 1 /* kIOSurfaceLockReadOnly */, NULL) != 0) {
-		RW_AGAIN("a copied surface could not be locked for reading\n");
+		RW_AGAIN('E', "SURF", "a copied surface could not be locked for reading\n");
 		return;
 	}
 	const void *base = base_of(_iosurface);
@@ -4294,7 +4820,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 
 	if (base != NULL && mesa.texture_write(_texture, 0, 0, origin, size, base, row, why,
 	    sizeof(why)) != 0) {
-		RW_AGAIN("a copied surface could not be written into its texture: %s\n", why);
+		RW_AGAIN('E', "SURF", "a copied surface could not be written into its texture: %s\n", why);
 	}
 	unlock(_iosurface, 1, NULL);
 	_copySeed = seed;
@@ -4330,15 +4856,15 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 - (NSUInteger)usage                { return _shape.usage; }
 - (BOOL)isFramebufferOnly          { return NO; }
 - (BOOL)allowGPUOptimizedContents  { return NO; }
-- (id)parentTexture                { return nil; }
-- (NSUInteger)parentRelativeLevel  { return 0; }
-- (NSUInteger)parentRelativeSlice  { return 0; }
-- (id)buffer                       { return nil; }
-- (NSUInteger)bufferOffset         { return 0; }
-- (NSUInteger)bufferBytesPerRow    { return 0; }
+- (id)parentTexture                { return _parent; }
+- (NSUInteger)parentRelativeLevel  { return _parentLevel; }
+- (NSUInteger)parentRelativeSlice  { return _parentSlice; }
+- (id)buffer                       { return _buffer; }
+- (NSUInteger)bufferOffset         { return _bufferOffset; }
+- (NSUInteger)bufferBytesPerRow    { return _bufferBytesPerRow; }
 /* what it was made over: CoreAnimation matches its textures to its surfaces by this */
-- (id)iosurface                    { return (id)_iosurface; }
-- (NSUInteger)iosurfacePlane       { return _iosurfacePlane; }
+- (id)iosurface                    { return _parent != nil ? [_parent iosurface] : (id)_iosurface; }
+- (NSUInteger)iosurfacePlane       { return _parent != nil ? [_parent iosurfacePlane] : _iosurfacePlane; }
 /* MTLStorageModeShared, except for a multisample texture, which Metal does not allow to be
  * one: "MTLTextureDescriptor: Multisample textures cannot be allocated with
  * MTLStorageModeShared on this device" is Metal's own sentence, in the framework's own
@@ -4380,7 +4906,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	(void)image;
 	if (mesa.texture_write(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
 			       stride, why, sizeof(why)) != 0) {
-		rw_print("writing texels: %s\n", why);
+		m2m_log('E', "RES", "writing texels: %s\n", why);
 	}
 }
 
@@ -4409,7 +4935,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	(void)image;
 	if (mesa.texture_read(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
 			      stride, why, sizeof(why)) != 0) {
-		rw_print("reading texels: %s\n", why);
+		m2m_log('E', "RES", "reading texels: %s\n", why);
 	}
 }
 
@@ -4433,22 +4959,26 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 			     (unsigned)region.size.depth };
 
 	if (mesa.depth_read == NULL) {
-		rw_print("this compiler library has no rwa_depth_read, so it is "
+		m2m_log('W', "RES", "this compiler library has no rwa_depth_read, so it is "
 		         "older than this driver and cannot say what a depth buffer holds\n");
 		return NO;
 	}
 	if (mesa.depth_read(_texture, 0, 0, origin, size, depth, stencil, why,
 			    sizeof(why)) != 0) {
-		rw_print("reading the depth of a texture: %s\n", why);
+		m2m_log('E', "RES", "reading the depth of a texture: %s\n", why);
 		return NO;
 	}
 	return YES;
 }
 
-/* A view of a texture is another texture over the same memory, and the compiler library has
- * no call for that yet; nil is the honest answer, and it is better than a view that aliases
- * nothing. */
-- (id)newTextureViewWithPixelFormat:(NSUInteger)format { (void)format; return nil; }
+/* A view of the whole texture in another format (Apple: "reinterpreting its data using a
+ * different pixel format"): the same type, every level and slice. */
+- (id)newTextureViewWithPixelFormat:(NSUInteger)format
+{
+	return [self newTextureViewWithPixelFormat:format textureType:_shape.type
+					    levels:NSMakeRange(0, MAX(_shape.mip_levels, 1u))
+					    slices:NSMakeRange(0, rw_texture_slices(&_shape))];
+}
 
 /*
  * THE REST OF WHAT <MTLTexture>, <MTLTextureSPI>, <MTLResource> AND <MTLResourceSPI>
@@ -4464,10 +4994,40 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 			     levels:(NSRange)levels
 			     slices:(NSRange)slices
 {
-	(void)format; (void)type; (void)levels; (void)slices;
-	RW_ONCE("a texture view is not implemented (the compiler library has no "
-		"call that makes a second texture over the same memory); nil\n");
-	return nil;
+	char why[256] = "the compiler library has no rwa_texture_view";
+	struct rwa_texture *view = NULL;
+	struct rwa_texture *parent = [self mesaTexture];
+
+	if (mesa.texture_view != NULL && parent != NULL) {
+		view = mesa.texture_view(parent, (unsigned)format, (unsigned)type,
+					 (unsigned)levels.location, (unsigned)levels.length,
+					 (unsigned)slices.location, (unsigned)slices.length, why,
+					 sizeof(why));
+	}
+	if (view == NULL) {
+		RW_AGAIN('E', "RES", "texture view of a %s (format %lu, %lu levels) as format %lu type %lu, "
+			 "levels %lu+%lu, slices %lu+%lu: %s; nil\n", rw_texture_type_name(_shape.type),
+			 (unsigned long)_shape.pixel_format, (unsigned long)_shape.mip_levels,
+			 (unsigned long)format, (unsigned long)type, (unsigned long)levels.location,
+			 (unsigned long)levels.length, (unsigned long)slices.location,
+			 (unsigned long)slices.length, why);
+		return nil;
+	}
+	rw_note_view(&_shape, format, type, levels, slices);
+
+	/* the view's own description, which is what Metal's getters answer for it */
+	struct rwa_texture_shape shape = _shape;
+	shape.pixel_format = (unsigned)format;
+	shape.type = (unsigned)type;
+	shape.width = MAX(_shape.width >> levels.location, 1u);
+	shape.height = MAX(_shape.height >> levels.location, 1u);
+	shape.depth = type == 7 /* 3D */ ? MAX(_shape.depth >> levels.location, 1u) : 1;
+	shape.mip_levels = (unsigned)levels.length;
+	shape.array_length = type == 6 /* CubeArray */ ? (unsigned)slices.length / 6 :
+			     type == 5 /* Cube */ ? 1 : (unsigned)slices.length;
+	return [[RedwoodMetalTexture alloc] initWithRedwoodParent:self texture:view shape:&shape
+							    level:levels.location
+							    slice:slices.location];
 }
 - (id)newTextureViewWithPixelFormat:(NSUInteger)format
 			textureType:(NSUInteger)type
@@ -4475,7 +5035,15 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 			     slices:(NSRange)slices
 			    swizzle:(MTLTextureSwizzleChannels)swizzle
 {
-	(void)swizzle;
+	/* the identity swizzle is the plain view; any other is refused by name rather than
+	 * dropped (a dropped swizzle is a picture with its channels in the wrong places) */
+	if (swizzle.red != MTLTextureSwizzleRed || swizzle.green != MTLTextureSwizzleGreen ||
+	    swizzle.blue != MTLTextureSwizzleBlue || swizzle.alpha != MTLTextureSwizzleAlpha) {
+		RW_AGAIN('E', "RES", "texture view with swizzle %u,%u,%u,%u: a swizzled view is not "
+			 "implemented (the compiler library's views take no swizzle); nil\n",
+			 swizzle.red, swizzle.green, swizzle.blue, swizzle.alpha);
+		return nil;
+	}
 	return [self newTextureViewWithPixelFormat:format textureType:type levels:levels
 					    slices:slices];
 }
@@ -4551,7 +5119,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 {
 	MTLResourceID resourceID = { 0 };
 
-	RW_ONCE("a GPU resource ID was asked of a texture; this driver has no "
+	RW_ONCE('W', "RES", "a GPU resource ID was asked of a texture; this driver has no "
 		"argument buffers and no bindless handles, so it answers zero\n");
 	return resourceID;
 }
@@ -4698,7 +5266,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	_info = *info;
 	/* and the same for a kernel with a set, for the same reason */
 	if (_info.argbuf_mask != 0) {
-		RW_ONCE("a compute pipeline declares argument buffers at Metal buffer indices "
+		RW_ONCE('W', "PSO", "a compute pipeline declares argument buffers at Metal buffer indices "
 			"%#x; their members are bound from what an MTLArgumentEncoder "
 			"recorded\n", _info.argbuf_mask);
 	}
@@ -4746,7 +5314,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	_render = render;
 	_info = *info;
 	if (info->generated_vertex_stage) {
-		rw_print("this pipeline's vertex stage was generated, so what it "
+		m2m_log('W', "PSO", "this pipeline's vertex stage was generated, so what it "
 		         "draws is the fragment shader over the whole attachment\n");
 	}
 	/* The first pipeline of this process whose shaders declare an ARGUMENT BUFFER, named
@@ -4755,7 +5323,7 @@ rw_fc_collect(id function, struct rwa_function_constant *out, unsigned max, NSMu
 	 * because the draw binds nothing of that set out of the buffer table -- it binds what
 	 * the encoder recorded for whatever buffer is bound there. */
 	if (info->vertex_argbuf_mask != 0 || info->fragment_argbuf_mask != 0) {
-		RW_ONCE("a render pipeline declares argument buffers: the vertex stage at "
+		RW_ONCE('W', "PSO", "a render pipeline declares argument buffers: the vertex stage at "
 			"Metal buffer indices %#x and the fragment stage at %#x. Their members "
 			"are bound from what an MTLArgumentEncoder recorded, and a buffer "
 			"bound there that nobody encoded is refused by name\n",
@@ -4963,7 +5531,7 @@ redwood_queue_semaphore(id queue)
 		ivar = base != Nil ? class_getInstanceVariable(base, "_commandBufferSemaphore")
 				   : NULL;
 		if (ivar == NULL) {
-			rw_print("_MTLCommandQueue has no "
+			m2m_log('W', "DEV", "_MTLCommandQueue has no "
 			         "_commandBufferSemaphore in this Metal, so the slot every "
 			         "command buffer takes cannot be given back and this queue "
 			         "will block on its maxCommandBufferCount'th buffer\n");
@@ -4989,7 +5557,7 @@ redwood_completion_ivar(void)
 		looked = YES;
 		ivar = base != Nil ? class_getInstanceVariable(base, "_completionQueue") : NULL;
 		if (ivar == NULL) {
-			rw_print("_MTLCommandQueue has no _completionQueue in this "
+			m2m_log('W', "DEV", "_MTLCommandQueue has no _completionQueue in this "
 			         "Metal, so -setCompletionQueue: keeps the queue in this driver's "
 			         "own field instead of the one Apple's getter reads\n");
 		}
@@ -5026,6 +5594,10 @@ redwood_clear_semaphore_debt(id commandBuffer)
 	 * lied to, and -setCompletionQueue: explains the third below. */
 	NSUInteger _gpuPriority, _backgroundGPUPriority;
 	dispatch_queue_t _completionQueue;   /* only used when Apple's own ivar is missing */
+	/* this queue's own completions, in commit order: the fence waits, and the handlers when the
+	 * caller named no completion queue (redwoodAsyncComplete) */
+	dispatch_queue_t _fenceQueue;
+	volatile uint32_t _pendingCompletions;   /* on _fenceQueue now (the slow-completion record says how many were ahead) */
 }
 
 - (instancetype)initWithRedwoodDevice:(RedwoodMetalDevice *)device descriptor:(id)descriptor
@@ -5038,10 +5610,17 @@ redwood_clear_semaphore_debt(id commandBuffer)
 		return nil;
 	}
 	_owner = device;
+	/* Apple's own, read in Metal (iOS 16.5 shared cache, 0x181a1d454): -[_MTLCommandQueue init...]
+	 * makes "com.Metal.CompletionQueueDispatch" serial at QOS_CLASS_USER_INTERACTIVE, relative
+	 * priority 0. Without it a completion inherits the committing thread's QoS -- none, from
+	 * CoreAnimation's render thread -- and ran at priority 31, where chronod's waited 2-7 s on
+	 * three saturated processors (PLANS/10-mali2metal.md, runs 12-14). */
+	_fenceQueue = dispatch_queue_create("com.Metal.CompletionQueueDispatch",
+		dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
 	/* Said at birth and once: this number is how many command buffers may exist at a
 	 * time before -commandBuffer blocks, and until this driver returned the slot it was
 	 * also how many this process could ever make. */
-	rw_print("this queue takes %lu command buffers at a time "
+	m2m_log('I', "DEV", "this queue takes %lu command buffers at a time "
 	         "(maxCommandBufferCount), and each one waits on the queue's semaphore in "
 	         "-[_MTLCommandBuffer initWithQueue:...]; this driver gives the slot back at "
 	         "-commit%s\n", (unsigned long)[self maxCommandBufferCount],
@@ -5051,6 +5630,17 @@ redwood_clear_semaphore_debt(id commandBuffer)
 }
 
 - (id)device { return _owner; }
+
+/*
+ * Where this queue's command buffers complete. One serial queue per command queue, as Metal's own
+ * (each _MTLCommandQueue delivers its own completions): until 27 October every command buffer of a
+ * process completed on ONE queue, so a completed handler that took 1.9 s in chronod held every other
+ * queue's completions back by 5 s (PLANS/10-mali2metal.md, item 3). Order within a queue is kept.
+ */
+- (dispatch_queue_t)redwoodFenceQueue { return _fenceQueue; }
+/* one more completion on the queue: how many were already there */
+- (uint32_t)redwoodCompletionQueued   { return __atomic_fetch_add(&_pendingCompletions, 1, __ATOMIC_RELAXED); }
+- (void)redwoodCompletionDone         { __atomic_fetch_sub(&_pendingCompletions, 1, __ATOMIC_RELAXED); }
 
 /* What the queue itself thinks, for a test that wants the number rather than the
  * inference: how many command buffers of this queue still hold one of those slots. */
@@ -5114,12 +5704,12 @@ redwood_clear_semaphore_debt(id commandBuffer)
 - (BOOL)setGPUPriority:(NSUInteger)priority
 {
 	if (priority > 5 || priority == 3) {
-		RW_ONCE("GPU priority %lu is outside what Apple's own "
+		RW_ONCE('W', "CMD", "GPU priority %lu is outside what Apple's own "
 			"_validateGPUPriority allows (0..5, and 3 is the background-only "
 			"one); it is remembered as asked, like Apple's own path, which "
 			"reports such a value and carries on\n", (unsigned long)priority);
 	}
-	RW_ONCE("a GPU priority of %lu was asked for; this driver has one ring "
+	RW_ONCE('I', "CMD", "a GPU priority of %lu was asked for; this driver has one ring "
 		"and one priority, so the number is remembered and reported back but nothing "
 		"schedules by it\n", (unsigned long)priority);
 	_gpuPriority = priority;
@@ -5131,7 +5721,7 @@ redwood_clear_semaphore_debt(id commandBuffer)
 - (BOOL)setGPUPriority:(NSUInteger)priority offset:(unsigned short)offset
 {
 	if (offset != 0) {
-		RW_ONCE("a GPU priority offset of %u is ignored: this driver has "
+		RW_ONCE('I', "CMD", "a GPU priority offset of %u is ignored: this driver has "
 			"one ring, so a place inside a priority band means nothing here\n",
 			(unsigned)offset);
 	}
@@ -5142,7 +5732,7 @@ redwood_clear_semaphore_debt(id commandBuffer)
  * answer, kept separately so that the two reads do not lie about each other. */
 - (BOOL)setBackgroundGPUPriority:(NSUInteger)priority
 {
-	RW_ONCE("a background GPU priority of %lu was asked for; remembered, "
+	RW_ONCE('I', "CMD", "a background GPU priority of %lu was asked for; remembered, "
 		"not honoured, for the same reason as the foreground one\n",
 		(unsigned long)priority);
 	_backgroundGPUPriority = priority;
@@ -5210,6 +5800,9 @@ redwood_clear_semaphore_debt(id commandBuffer)
 	 * -[_MTLCommandQueue dealloc], and releasing it twice would be worse than leaking
 	 * one dispatch queue in the Metal where that dealloc does not. */
 	[_completionQueue release];
+	if (_fenceQueue != NULL) {
+		dispatch_release(_fenceQueue);
+	}
 	[super dealloc];
 }
 
@@ -5254,6 +5847,47 @@ enum {
 	RW_CB_ERROR        = 5,
 };
 
+/*
+ * What MetalPerformanceShaders checks before it will work with a command buffer of ours, said once per
+ * process as soon as MPS is loaded in it (PLANS/10-mali2metal.md, run 2: mediaserverd dies in
+ * MPSAutoCache::MPSAutoCache on a nil MPSCommandBufferImageCache). -[MPSCommandBufferImageCache
+ * initWithCommandBuffer:] returns nil when the buffer does not conform to MTLCommandBuffer or when
+ * MPSDevice::GetMPSDevice finds no MPS device for [buffer device] -- a ladder of -supportsFamily: from
+ * Apple8 down to Apple2, with -name compared to Apple's GPU names on some rungs (MPSCore, iOS 16.5). Its
+ * own verdict is the public MPSSupportsMTLDevice(), taken from the process when MPS is there, so this
+ * loads nothing into a process that does not already use MPS. Checked on every 64th new command buffer
+ * until MPS appears, then never again.
+ */
+static void
+rw_mps_facts(id commandBuffer, id device)
+{
+	static unsigned seen;
+	static BOOL said;
+	BOOL (*supports)(id);
+	char families[64] = "";
+	size_t used = 0;
+
+	if (said || (seen++ & 63) != 0) {
+		return;
+	}
+	*(void **)&supports = dlsym(RTLD_DEFAULT, "MPSSupportsMTLDevice");
+	if (supports == NULL) {
+		return;
+	}
+	said = YES;
+	for (NSUInteger family = 1001; family <= 1008; family++) {
+		if ([device supportsFamily:(MTLGPUFamily)family]) {
+			used += (size_t)snprintf(families + used, sizeof(families) - used, " Apple%lu",
+			    (unsigned long)(family - 1000));
+		}
+	}
+	m2m_log(supports(device) ? 'I' : 'E', "DEV", "MPS: MPSSupportsMTLDevice %s; families claimed:%s; name \"%s\"; "
+	    "command buffer conforms to MTLCommandBuffer %s; userDictionary %s", supports(device) ? "YES" : "NO",
+	    used ? families : " none", [[device name] UTF8String],
+	    [commandBuffer conformsToProtocol:@protocol(MTLCommandBuffer)] ? "YES" : "NO",
+	    [commandBuffer userDictionary] != nil ? "present" : "nil");
+}
+
 @implementation RedwoodMetalCommandBuffer {
 	BOOL _tracing;          /* (rwm_trace) this commit is being written out */
 	RedwoodMetalCommandQueue *_queue;
@@ -5292,7 +5926,7 @@ enum {
 - (void)setProtectionOptions:(NSUInteger)options
 {
 	if (options != 0 && _protectionOptions != options) {
-		RW_ONCE("a command buffer was asked for protection options %lu, and this "
+		RW_ONCE('W', "CMD", "a command buffer was asked for protection options %lu, and this "
 			"driver has no protected memory to give: the request is kept and not honoured, "
 			"because nothing it would protect is protected here either\n",
 			(unsigned long)options);
@@ -5320,7 +5954,7 @@ enum {
 	 * constants that answer -status: a log that does NOT carry this line was written before
 	 * the numbers became Metal's, and says committed 3, scheduled 4, completed 6 (see the
 	 * note above this class). */
-	RW_ONCE("MTLCommandBufferStatus: committed %u, scheduled %u, completed %u, "
+	RW_ONCE('I', "DEV", "MTLCommandBufferStatus: committed %u, scheduled %u, completed %u, "
 		"error %u -- Metal's own numbers; a log without this line was written by the old "
 		"ones (committed 3, scheduled 4, completed 6)\n",
 		(unsigned)RW_CB_COMMITTED, (unsigned)RW_CB_SCHEDULED,
@@ -5328,6 +5962,7 @@ enum {
 	_status = RW_CB_ENQUEUED;   /* nothing is pending yet */
 	_owesSlot = YES;
 	[queue redwoodTookSlot];
+	rw_mps_facts(self, [queue device]);
 	return self;
 }
 
@@ -5344,13 +5979,22 @@ enum {
  */
 - (void)redwoodAsyncComplete:(void *)fence submitted:(uint64_t)submitted
 {
-	static dispatch_queue_t fences;
-	static dispatch_once_t once;
+	dispatch_queue_t fences = [_queue redwoodFenceQueue];
 	NSArray *scheduled = _scheduled, *completed = _completed;
+	qos_class_t committed_qos = qos_class_self();   /* (the slow-completion record says it) */
+	uint32_t ahead = [_queue redwoodCompletionQueued];
+	/* the three parts of commit -> the fence block's start, which the record names apart: the
+	 * commit's own bookkeeping after the submit (report, snap, slot), the scheduled handlers
+	 * (inline on this thread when the caller named no completion queue), the fence queue */
+	uint64_t entered = rw_now_ns(), enqueued;
+	NSUInteger nscheduled = [scheduled count];
+	int commit_pri, commit_base;
+	host_cpu_load_info_data_t cpu_enqueued;
+	bool have_cpu = rw_cpu_ticks(&cpu_enqueued);
 
-	dispatch_once(&once, ^{
-		fences = dispatch_queue_create("com.redwood.metal.fences", DISPATCH_QUEUE_SERIAL);
-	});
+	rw_thread_priority(&commit_pri, &commit_base);
+	BOOL inline_handlers = [_queue redwoodCompletionQueue] == nil;
+
 	_scheduled = nil;
 	_completed = nil;
 	_inflight = dispatch_group_create();
@@ -5360,12 +6004,17 @@ enum {
 	}
 	[scheduled release];
 	[self retain];
+	enqueued = rw_now_ns();
 	dispatch_async(fences, ^{
 		char why[256] = { 0 };
-		uint64_t done;
+		uint64_t started = rw_now_ns(), signalled, ended;
+		qos_class_t ran_qos = qos_class_self();
+		host_cpu_load_info_data_t cpu_started;
+		bool have_cpu_started = have_cpu && rw_cpu_ticks(&cpu_started);
+		NSUInteger handlers = [completed count], steps = [_work count];
 
 		if (mesa.fence_wait([[_queue device] mesaDevice], fence, why, sizeof(why)) != 0) {
-			rw_print("THE GPU DID NOT FINISH: %s\n", why);
+			m2m_log('E', "CMD", "THE GPU DID NOT FINISH: %s\n", why);
 			_error = [[NSError errorWithDomain:@"RedwoodMetal" code:3
 						  userInfo:@{ NSLocalizedDescriptionKey:
 							      [NSString stringWithUTF8String:why] }] retain];
@@ -5373,16 +6022,69 @@ enum {
 		} else {
 			_status = RW_CB_COMPLETED;
 		}
-		done = rw_now_ns();
+		/* "GPU wait" is the fence alone: from when this completion's turn came to the fence */
+		signalled = rw_now_ns();
 		pthread_mutex_lock(&rw_stats_lock);
-		rw_perf.wait_ns += done - submitted;
-		rw_perf.wait_max = MAX(rw_perf.wait_max, done - submitted);
+		rw_perf.wait_ns += signalled - started;
+		rw_perf.wait_max = MAX(rw_perf.wait_max, signalled - started);
 		pthread_mutex_unlock(&rw_stats_lock);
 		dispatch_group_leave(_inflight);
 		for (id handler in completed) {
 			[self redwoodDeliver:(void (^)(id))handler];
 		}
 		[completed release];
+		ended = rw_now_ns();
+		[_queue redwoodCompletionDone];
+		pthread_mutex_lock(&rw_stats_lock);
+		rw_perf.completions++;
+		rw_perf.completion_ns += ended - submitted;
+		rw_perf.completion_max = MAX(rw_perf.completion_max, ended - submitted);
+		pthread_mutex_unlock(&rw_stats_lock);
+		if (ended - submitted > 100 * NSEC_PER_MSEC) {
+			int ran_pri, ran_base, role, darwinbg;
+
+			rw_thread_priority(&ran_pri, &ran_base);
+			rw_task_standing(&role, &darwinbg);
+			/* where the processors were while the block waited on the fence queue: busy (it lost
+			 * to other work) or idle (nothing ran it although a processor was free) */
+			char cpu[128] = "processors: unknown";
+
+			if (have_cpu_started) {
+				uint64_t d[CPU_STATE_MAX], total = 0;
+
+				for (int k = 0; k < CPU_STATE_MAX; k++) {
+					d[k] = (uint64_t)(cpu_started.cpu_ticks[k] - cpu_enqueued.cpu_ticks[k]);
+					total += d[k];
+				}
+				if (total) {
+					host_basic_info_data_t basic;
+					mach_msg_type_number_t bcount = HOST_BASIC_INFO_COUNT;
+					mach_port_t hostp = mach_host_self();
+					int avail = host_info(hostp, HOST_BASIC_INFO, (host_info_t)&basic,
+							      &bcount) == KERN_SUCCESS ? basic.avail_cpus : -1;
+
+					mach_port_deallocate(mach_task_self(), hostp);
+					snprintf(cpu, sizeof(cpu), "%d processors; while it waited: %.0f%% idle, %.0f%% user, "
+					    "%.0f%% system (%llu ticks)", avail, 100.0 * d[CPU_STATE_IDLE] / total,
+					    100.0 * (d[CPU_STATE_USER] + d[CPU_STATE_NICE]) / total,
+					    100.0 * d[CPU_STATE_SYSTEM] / total, (unsigned long long)total);
+				}
+			}
+			m2m_log('I', "PERF", "slow completion's scheduling: committing thread priority %d (base %d), "
+			    "completing thread %d (base %d); task role %d, darwinbg %d; %s", commit_pri, commit_base,
+			    ran_pri, ran_base, role, darwinbg, cpu);
+			m2m_log('W', "PERF", "slow completion: %.1f ms from commit to its completed handlers: commit bookkeeping %.1f ms, "
+			    "%lu scheduled handler%s %.1f ms (%s), on the fence queue %.1f ms, GPU fence %.1f ms, "
+			    "%lu completed handler%s %.1f ms; %lu steps; queue %p \"%s\"; "
+			    "QoS committed %#x, completed %#x; %u completion%s ahead on this queue at the commit",
+			    (ended - submitted) / 1e6, (entered - submitted) / 1e6,
+			    (unsigned long)nscheduled, nscheduled == 1 ? "" : "s", (enqueued - entered) / 1e6,
+			    inline_handlers ? "inline on the committing thread" : "sent to the caller's completion queue",
+			    (started - enqueued) / 1e6, (signalled - started) / 1e6,
+			    (unsigned long)handlers, handlers == 1 ? "" : "s", (ended - signalled) / 1e6, (unsigned long)steps,
+			    (void *)_queue, [[_queue label] UTF8String] ?: "", (unsigned)committed_qos, (unsigned)ran_qos,
+			    ahead, ahead == 1 ? "" : "s");
+		}
 		[self release];
 	});
 }
@@ -5432,7 +6134,7 @@ enum {
 - (id)renderCommandEncoderWithDescriptor:(id)descriptor
 {
 	if (descriptor == nil) {
-		rw_print("a render pass needs a descriptor\n");
+		m2m_log('E', "ENC", "a render pass needs a descriptor\n");
 		return nil;
 	}
 	return [[[RedwoodMetalRenderEncoder alloc] initWithRedwoodCommandBuffer:self
@@ -5560,7 +6262,7 @@ rw_commit_report(uint64_t draws, uint64_t commit_ns, uint64_t wait_ns,
 		    top[best], left[best]);
 		left[best] = 0;
 	}
-	rw_print("slow: %.1f ms commit (%.1f ms GPU wait), %llu draws: %s\n",
+	m2m_log('W', "PERF", "slow: %.1f ms commit (%.1f ms GPU wait), %llu draws: %s\n",
 	    commit_ns / 1e6, wait_ns / 1e6, (unsigned long long)draws, line);
 }
 
@@ -5581,7 +6283,7 @@ rw_commit_report(uint64_t draws, uint64_t commit_ns, uint64_t wait_ns,
 	if (rw_trace_force > 0 && __sync_fetch_and_sub(&rw_trace_force, 1) > 0) {
 		trace = YES;
 		_tracing = YES;
-		rw_print("trace: a command buffer of %lu steps (asked for)\n", (unsigned long)[_work count]);
+		m2m_log('I', "TRACE", "trace: a command buffer of %lu steps (asked for)\n", (unsigned long)[_work count]);
 	} else if (rw_trace_budget() > 0) {
 		id first = nil;
 
@@ -5602,7 +6304,7 @@ rw_commit_report(uint64_t draws, uint64_t commit_ns, uint64_t wait_ns,
 		if (trace) {
 			rw_trace_done++;
 			_tracing = YES;
-			rw_print("trace: a command buffer of %lu steps\n", (unsigned long)[_work count]);
+			m2m_log('I', "TRACE", "trace: a command buffer of %lu steps\n", (unsigned long)[_work count]);
 		}
 	}
 	_status = RW_CB_COMMITTED;
@@ -5620,8 +6322,18 @@ rw_commit_report(uint64_t draws, uint64_t commit_ns, uint64_t wait_ns,
 			}
 		}
 		if (work->blit != nil) {
-			if (!work->blit(why, sizeof(why))) {
-				rw_print("a blit failed: %s\n", why);
+			uint64_t t_blit = rw_now_ns();
+			BOOL blit_ok = work->blit(why, sizeof(why));
+			uint64_t blit_ns = rw_now_ns() - t_blit;
+
+			/* (the 481 ms one at SpringBoard's first commit: a blit is where a surface
+			 * import or a whole-texture copy hides, and nothing else was accounting for it) */
+			if (blit_ns >= 5000000ULL) {
+				m2m_log('W', "PERF", "slow blit: %.1f ms: %s\n", blit_ns / 1e6,
+				    work->note != NULL ? work->note : "blit");
+			}
+			if (!blit_ok) {
+				m2m_log('E', "CMD", "a blit failed: %s\n", why);
 				[self failWith:why];
 			}
 			queued = YES;
@@ -5663,7 +6375,7 @@ rw_commit_report(uint64_t draws, uint64_t commit_ns, uint64_t wait_ns,
 			table[i].buffer = buffers[i];
 			table[i].offset = work->bufferOffsets[i];
 			if (buffers[i] == NULL && work->buffers[i] != nil) {
-				rw_print("buffer %u of this dispatch did not come "
+				m2m_log('E', "ENC", "buffer %u of this dispatch did not come "
 				         "from the compiler library, so it cannot be bound\n", i);
 			}
 		}
@@ -5691,7 +6403,7 @@ rw_commit_report(uint64_t draws, uint64_t commit_ns, uint64_t wait_ns,
 			    : mesa.dispatch([work->pipeline compute], &bindings, work->groups,
 					    work->size, why, sizeof(why));
 		if (rc != 0) {
-			rw_print("the dispatch failed: %s\n", why);
+			m2m_log('E', "CMD", "the dispatch failed: %s\n", why);
 			_error = [[NSError errorWithDomain:@"RedwoodMetal" code:2
 						  userInfo:@{ NSLocalizedDescriptionKey:
 							      [NSString stringWithUTF8String:why] }]
@@ -5721,7 +6433,7 @@ rw_commit_report(uint64_t draws, uint64_t commit_ns, uint64_t wait_ns,
 	t_wait = rw_now_ns();
 	if (queued && mesa.finish != NULL &&
 	    mesa.finish([[_queue device] mesaDevice], why, sizeof(why)) != 0) {
-		rw_print("the command buffer's draws did not finish: %s\n", why);
+		m2m_log('E', "CMD", "the command buffer's draws did not finish: %s\n", why);
 		[self failWith:why];
 		goto done;
 	}
@@ -5749,6 +6461,7 @@ done:
  * mean a struct whose fields mean different things depending on a flag. */
 - (BOOL)runDraw:(RedwoodMetalWork *)work why:(char *)why size:(size_t)size
 {
+	uint64_t t_draw = rw_now_ns(), t_gallium = 0;
 	struct rwa_texture *color[8] = { NULL };
 	struct rwa_buffer *vertex_buffers[RW_MAX_BUFFERS] = { NULL };
 	struct rwa_vertex_stream vertex_streams[RW_MAX_BUFFERS] = { { NULL, 0 } };
@@ -5908,6 +6621,10 @@ done:
 		.fragment_buffer_table_count = work->count,
 		.scissor = work->hasScissor ? work->scissor : NULL,
 		.viewport = work->hasViewport ? work->viewport : NULL,
+		.color_level = work->colorLevel,
+		.color_layer = work->colorSlice,
+		.depth_level = work->depthLevel,
+		.depth_layer = work->depthSlice,
 		/* queued, and -commit waits once for the whole command buffer (rwm_trace: each
 		 * draw waited for, so that its effect can be read back) */
 		.deferred = mesa.finish != NULL && !_tracing && dump == 0,
@@ -5920,8 +6637,54 @@ done:
 		return NO;
 	}
 
-	if (mesa.render_draw([work->render render], &draw, why, size) != 0) {
-		rw_print("the draw failed: %s\n", why);
+	t_gallium = rw_now_ns();
+	int draw_rc = mesa.render_draw([work->render render], &draw, why, size);
+	uint64_t gallium_ns = rw_now_ns() - t_gallium;
+
+	uint64_t draw_total = rw_now_ns() - t_draw;
+	static int slow_draw_us = -1;
+
+	pthread_mutex_lock(&rw_stats_lock);
+	rw_perf.draw_calls++;
+	rw_perf.draw_ns += draw_total;
+	rw_perf.gallium_ns += gallium_ns;
+	pthread_mutex_unlock(&rw_stats_lock);
+	if (slow_draw_us < 0) {
+		const char *e = getenv("RWM_SLOW_DRAW_US");
+		slow_draw_us = e != NULL ? atoi(e) : 300;
+	}
+	/*
+	 * A draw that costs far more than the ~30 us one costs on average: the frame it is in is
+	 * the one the user calls slow, and the label plus the counts say whether it is a state
+	 * change, a texture that had to be imported, or the library itself.
+	 */
+	if (slow_draw_us > 0 && draw_total >= (uint64_t)slow_draw_us * 1000ULL) {
+		NSString *dl = [work->render label];
+
+		m2m_log('W', "PERF", "slow draw: %.1f ms (Gallium %.1f ms) %s | %u colour, %u tex, %u vbuf, "
+		    "%u fbuf, %u sampler%s%s\n", draw_total / 1e6, gallium_ns / 1e6,
+		    dl != nil ? [dl UTF8String] : "(no label)", work->colorCount, work->textureCount,
+		    work->vertexBufferCount, work->count, work->samplerCount,
+		    work->hasScissor ? ", scissor" : "", work->hasViewport ? ", viewport" : "");
+	}
+	{
+		RedwoodMetalRenderPipeline *rp = work->render;
+
+		rp->_draws++;
+		rp->_draw_ns += gallium_ns;
+		if (rp->_draws == 1) {
+			rp->_first_ns = gallium_ns;
+			if (gallium_ns >= 300000ULL) {
+				NSString *l = [rp label];
+
+				m2m_log('I', "PERF", "first draw: %.1f ms %s (the whole of it in the library: a variant "
+				    "compile or a surface, not our binding)\n", gallium_ns / 1e6,
+				    l != nil ? [l UTF8String] : "(no label)");
+			}
+		}
+	}
+	if (draw_rc != 0) {
+		m2m_log('E', "CMD", "the draw failed: %s\n", why);
 		[self failWith:why];
 		return NO;
 	}
@@ -5981,7 +6744,7 @@ done:
 	uint8_t now[16];
 
 	if ([self probe:t x:x y:y into:now]) {
-		rw_print("trace:     pixel %u,%u: %02x%02x%02x%02x -> %02x%02x%02x%02x%s\n", x, y,
+		m2m_log('I', "TRACE", "trace:     pixel %u,%u: %02x%02x%02x%02x -> %02x%02x%02x%02x%s\n", x, y,
 		    before[0], before[1], before[2], before[3], now[0], now[1], now[2], now[3],
 		    memcmp(before, now, 4) == 0 ? " (unchanged)" : "");
 	}
@@ -5994,12 +6757,12 @@ done:
 	const char *label = "?";
 
 	if (w->blit != nil) {
-		rw_print("trace:   pass %u blit %s\n", w->pass, w->note != NULL ? w->note : "?");
+		m2m_log('I', "TRACE", "trace:   pass %u blit %s\n", w->pass, w->note != NULL ? w->note : "?");
 		return;
 	}
 	rw_tex_desc(w->colorCount > 0 ? w->color[0] : w->depth, target, sizeof(target));
 	if (w->clearOnly) {
-		rw_print("trace:   pass %u clear-only %s L%u ld%u st%u%s\n", w->pass, target, w->level,
+		m2m_log('I', "TRACE", "trace:   pass %u clear-only %s L%u ld%u st%u%s\n", w->pass, target, w->level,
 		    w->loadAction, w->storeAction, w->clears ? " colour" : "");
 		return;
 	}
@@ -6030,7 +6793,7 @@ done:
 		snprintf(ds, sizeof(ds), "%s ref%u", [w->depthStencilState redwoodSummary],
 		    w->stencilReference[0]);
 	}
-	rw_print("trace:   pass %u -> %s(+%u) L%u ld%u st%u%s sc %u,%u %ux%u | %s | zs %s%s%s ds %s | "
+	m2m_log('I', "TRACE", "trace:   pass %u -> %s(+%u) L%u ld%u st%u%s sc %u,%u %ux%u | %s | zs %s%s%s ds %s | "
 	    "tex%s | %u%s verts x%u\n", w->pass, target, w->colorCount > 0 ? w->colorCount - 1 : 0,
 	    w->level, w->loadAction, w->storeAction, w->clears ? " CLEAR" : "",
 	    w->hasScissor ? w->scissor[0] : 0, w->hasScissor ? w->scissor[1] : 0,
@@ -6069,7 +6832,7 @@ done:
 	BOOL rgba = f == MTLPixelFormatRGBA8Unorm || f == MTLPixelFormatRGBA8Unorm_sRGB;
 
 	if (!bgra && !rgba) {
-		RW_ONCE("snap: the screen is pixel format %lu, which the snapshot does not read\n",
+		RW_ONCE('W', "TRACE", "snap: the screen is pixel format %lu, which the snapshot does not read\n",
 		    (unsigned long)f);
 		return;
 	}
@@ -6088,7 +6851,7 @@ done:
 
 		if (mesa.texture_read([target mesaTexture], 0, 0, origin, size, row, (size_t)w * 4,
 		    why, sizeof(why)) != 0) {
-			rw_print("snap %u: reading row %u failed: %s\n", n, y, why);
+			m2m_log('E', "TRACE", "snap %u: reading row %u failed: %s\n", n, y, why);
 			free(row);
 			return;
 		}
@@ -6107,15 +6870,15 @@ done:
 	NSUInteger len = [b64 length];
 	unsigned lines = (unsigned)((len + LINE - 1) / LINE);
 
-	rw_print("snap %u: %ux%u of a %ux%u screen (format %lu), %lu bytes deflated, %u lines\n", n,
+	m2m_log('I', "TRACE", "snap %u: %ux%u of a %ux%u screen (format %lu), %lu bytes deflated, %u lines\n", n,
 	    ow, oh, w, h, (unsigned long)f, (unsigned long)[z length], lines);
 	for (unsigned i = 0; i < lines; i++) {
 		NSUInteger at = (NSUInteger)i * LINE;
 		NSString *part = [b64 substringWithRange:NSMakeRange(at, MIN((NSUInteger)LINE, len - at))];
 
-		rw_print("snap %u %u: %s\n", n, i, [part UTF8String]);
+		m2m_log('I', "TRACE", "snap %u %u: %s\n", n, i, [part UTF8String]);
 	}
-	rw_print("snap %u: end\n", n);
+	m2m_log('I', "TRACE", "snap %u: end\n", n);
 }
 
 /*
@@ -6230,7 +6993,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 		rw_tex_desc(work->color[i], d, sizeof(d));
 		at += (size_t)snprintf(targets + at, sizeof(targets) - at, " c%u=%s", i, d);
 	}
-	rw_print("dump %s: %s | pass %u%s | prim %u start %u count %u%s inst %u | scissor %s%u,%u %ux%u\n",
+	m2m_log('I', "TRACE", "dump %s: %s | pass %u%s | prim %u start %u count %u%s inst %u | scissor %s%u,%u %ux%u\n",
 	    kind == 1 ? "FILL" : kind == 3 ? "SHAPE" : "IMAGE", label != nil ? [label UTF8String] : "?", work->pass, targets,
 	    work->primitive, work->vertexStart, work->vertexCount,
 	    work->indexBuffer != nil ? (work->indexType == 0 ? " idx16" : " idx32") : "",
@@ -6238,7 +7001,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 	    work->scissor[2], work->scissor[3]);
 	for (unsigned i = 0; vs != NULL && i < 8; i++) {
 		if (vs->format[i] != 0) {
-			rw_print("dump   attribute %u: format %u offset %u buffer %u (stride %u step %u)\n", i,
+			m2m_log('I', "TRACE", "dump   attribute %u: format %u offset %u buffer %u (stride %u step %u)\n", i,
 			    vs->format[i], vs->offset[i], vs->buffer[i], vs->stride[vs->buffer[i] & 7],
 			    vs->step[vs->buffer[i] & 7]);
 		}
@@ -6254,7 +7017,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 		const uint8_t *p = (const uint8_t *)[buf contents] + off;
 
 		if (off >= len) {
-			rw_print("dump   vertex buffer %u: offset %zu past its %zu bytes\n", b, off, len);
+			m2m_log('I', "TRACE", "dump   vertex buffer %u: offset %zu past its %zu bytes\n", b, off, len);
 			continue;
 		}
 		if (work->indexBuffer == nil && b != 2 && vs != NULL && vs->stride[b] != 0 &&
@@ -6262,13 +7025,13 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 			p += (size_t)work->vertexStart * vs->stride[b];
 		}
 		rw_hex(hex, sizeof(hex), p, MIN(want, len - off));
-		rw_print("dump   vertex buffer %u (%zu bytes, offset %zu): %s\n", b, len, off, hex);
+		m2m_log('I', "TRACE", "dump   vertex buffer %u (%zu bytes, offset %zu): %s\n", b, len, off, hex);
 	}
 	if (work->vertexBufferCount > 2 && work->vertexBuffers[2] != nil) {
 		const float *m = (const float *)((const uint8_t *)[work->vertexBuffers[2] contents] +
 		    work->vertexBufferOffsets[2]);
 
-		rw_print("dump   matrix columns: (%g %g %g %g) (%g %g %g %g) (%g %g %g %g) (%g %g %g %g)\n",
+		m2m_log('I', "TRACE", "dump   matrix columns: (%g %g %g %g) (%g %g %g %g) (%g %g %g %g) (%g %g %g %g)\n",
 		    m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
 		    m[14], m[15]);
 	}
@@ -6276,13 +7039,13 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 		uint8_t now[16];
 
 		if (work->color[i] != nil && [self probe:work->color[i] x:px y:py into:now]) {
-			rw_print("dump   pixel %u,%u of c%u: %02x%02x%02x%02x -> %02x%02x%02x%02x%s\n", px, py, i,
+			m2m_log('I', "TRACE", "dump   pixel %u,%u of c%u: %02x%02x%02x%02x -> %02x%02x%02x%02x%s\n", px, py, i,
 			    before[i][0], before[i][1], before[i][2], before[i][3], now[0], now[1], now[2],
 			    now[3], memcmp(before[i], now, 4) == 0 ? " (unchanged)" : "");
 		}
 	}
 	if (!probed) {
-		rw_print("dump   (no pixel: the first triangle's position could not be worked out)\n");
+		m2m_log('I', "TRACE", "dump   (no pixel: the first triangle's position could not be worked out)\n");
 	}
 }
 
@@ -6309,9 +7072,13 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 		.clear_depth = work->clearsDepth ? &work->clearDepth : NULL,
 		.clear_stencil = work->clearsStencil ? &work->clearStencil : NULL,
 		.deferred = mesa.finish != NULL,
+		.color_level = work->colorLevel,
+		.color_layer = work->colorSlice,
+		.depth_level = work->depthLevel,
+		.depth_layer = work->depthSlice,
 	};
 	if (mesa.render_clear([[_queue device] mesaDevice], &draw, why, size) != 0) {
-		rw_print("the clear failed: %s\n", why);
+		m2m_log('E', "CMD", "the clear failed: %s\n", why);
 		[self failWith:why];
 		return NO;
 	}
@@ -6340,7 +7107,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 		return;
 	}
 	if (mesa.finish([[_queue device] mesaDevice], why, sizeof(why)) != 0) {
-		rw_print("THE GPU DID NOT FINISH: %s\n", why);
+		m2m_log('E', "CMD", "THE GPU DID NOT FINISH: %s\n", why);
 		_error = [[NSError errorWithDomain:@"RedwoodMetal" code:3
 					  userInfo:@{ NSLocalizedDescriptionKey:
 						      [NSString stringWithUTF8String:why] }] retain];
@@ -6460,7 +7227,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 - (void)commitWithDeadline:(NSUInteger)deadline
 {
 	(void)deadline;
-	RW_ONCE("a command buffer was committed with a deadline; this driver "
+	RW_ONCE('W', "CMD", "a command buffer was committed with a deadline; this driver "
 		"has one ring and no scheduler to tell, so the work is committed and the "
 		"deadline is not promised\n");
 	[self commit];
@@ -6477,7 +7244,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
  * rather than a silent buffer that fails later for no stated reason. */
 - (void)redwoodPurgedNote
 {
-	RW_ONCE("Metal reported a purged resource on a command buffer, but "
+	RW_ONCE('W', "CMD", "Metal reported a purged resource on a command buffer, but "
 		"nothing this driver allocates is volatile; the report is noted and the "
 		"buffer is not failed\n");
 }
@@ -6507,6 +7274,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 	float _clearDepth;
 	unsigned _clearStencil;
 	BOOL _clearsDepth, _clearsStencil;
+	unsigned _depthLevel, _depthSlice;
 	unsigned _stencilReference[2];
 	float _depthRange[2];
 	BOOL _hasDepthRange;
@@ -6547,12 +7315,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 		_slice[i] = (unsigned)([attachment slice] + [attachment depthPlane]);
 		_load[i] = (unsigned)[attachment loadAction];
 		_store[i] = (unsigned)[attachment storeAction];
-		/* the library draws into level 0, slice 0 of an attachment: anything else would land
-		 * there instead, so it is said (once) rather than drawn quietly in the wrong place */
-		if (_level[i] != 0 || _slice[i] != 0) {
-			RW_ONCE("a pass draws into level %u, slice %u of an attachment, and this "
-				"driver draws into level 0, slice 0\n", _level[i], _slice[i]);
-		}
+		/* (the level and slice go to the library with each draw: rwa_draw.color_level) */
 		/*
 		 * A resolve is the one thing a multisample pass asks for that this driver
 		 * cannot do, and it is said out loud rather than ignored. The compiler
@@ -6613,11 +7376,17 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 	id stex = [sa texture];
 
 	if (ztex != nil && stex != nil && ztex != stex) {
-		rw_print("the depth attachment and the stencil attachment are two "
+		m2m_log('W', "ENC", "the depth attachment and the stencil attachment are two "
 		         "different textures; one texture carries both aspects here, so this "
 		         "pass is encoded with neither\n");
 	} else {
 		_depth = ztex != nil ? ztex : stex;
+		{
+			MTLRenderPassAttachmentDescriptor *d = ztex != nil ? (id)za : (id)sa;
+
+			_depthLevel = (unsigned)[d level];
+			_depthSlice = (unsigned)([d slice] + [d depthPlane]);
+		}
 		if (ztex != nil && [za loadAction] == MTLLoadActionClear) {
 			_clearDepth = (float)[za clearDepth];
 			_clearsDepth = YES;
@@ -6648,7 +7417,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 - (void)setVertexBuffer:(id)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
 	if (index >= RW_MAX_BUFFERS) {
-		rw_print("vertex buffer %lu is past this driver's limit of %u\n",
+		m2m_log('E', "ENC", "vertex buffer %lu is past this driver's limit of %u\n",
 		         (unsigned long)index, RW_MAX_BUFFERS);
 		_complained = YES;
 		return;
@@ -6675,7 +7444,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 - (void)setFragmentBuffer:(id)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
 	if (index >= RW_MAX_BUFFERS) {
-		rw_print("fragment buffer %lu is past this driver's limit of %u\n",
+		m2m_log('E', "ENC", "fragment buffer %lu is past this driver's limit of %u\n",
 		         (unsigned long)index, RW_MAX_BUFFERS);
 		_complained = YES;
 		return;
@@ -6796,7 +7565,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 - (void)setDepthStencilState:(id)state
 {
 	if (state != nil && ![state isKindOfClass:[RedwoodMetalDepthStencilState class]]) {
-		rw_print("this depth/stencil state is a %s and not one of ours, so "
+		m2m_log('E', "ENC", "this depth/stencil state is a %s and not one of ours, so "
 		         "it cannot be bound; this pass draws with no depth test\n",
 		         class_getName(object_getClass(state)));
 		state = nil;
@@ -6821,7 +7590,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 	RedwoodMetalWork *work = [[RedwoodMetalWork alloc] init];
 
 	if (_pipeline == nil || (_colorCount == 0 && _depth == nil)) {
-		rw_print("this draw has %s and is dropped\n",
+		m2m_log('E', "ENC", "this draw has %s and is dropped\n",
 		         _pipeline == nil ? "no pipeline state" : "nothing to draw into");
 		[work release];
 		return;
@@ -6836,7 +7605,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 	 */
 	if (baseVertex < INT32_MIN || baseVertex > INT32_MAX || instances > UINT32_MAX ||
 	    baseInstance > UINT32_MAX || count > UINT32_MAX || start > UINT32_MAX) {
-		rw_print("this draw does not fit the contract's 32 bits (count %lu, "
+		m2m_log('E', "ENC", "this draw does not fit the contract's 32 bits (count %lu, "
 		         "start %lu, base vertex %ld, %lu instances from %lu) and is dropped "
 		         "rather than wrapped\n", (unsigned long)count, (unsigned long)start,
 		         (long)baseVertex, (unsigned long)instances, (unsigned long)baseInstance);
@@ -6848,7 +7617,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 	 * this -- but a caller measuring such a shader would otherwise be left reading a
 	 * colour attachment that holds its clear value and nothing else. */
 	if ([_pipeline writesDepth] && _depth == nil && !_complained) {
-		rw_print("this pipeline's fragment shader stores to [[depth]] and "
+		m2m_log('W', "ENC", "this pipeline's fragment shader stores to [[depth]] and "
 		         "this pass has no depth attachment, so those writes go nowhere\n");
 		_complained = YES;
 	}
@@ -6885,6 +7654,10 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 	work->pass = _pass;
 	work->level = _level[0];
 	work->slice = _slice[0];
+	memcpy(work->colorLevel, _level, sizeof(work->colorLevel));
+	memcpy(work->colorSlice, _slice, sizeof(work->colorSlice));
+	work->depthLevel = _depthLevel;
+	work->depthSlice = _depthSlice;
 	work->loadAction = _load[0];
 	work->storeAction = _store[0];
 	work->stencilReference[0] = _stencilReference[0];
@@ -7080,7 +7853,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 		 baseInstance:(NSUInteger)baseInstance
 {
 	if (buffer == nil) {
-		rw_print("an indexed draw with no index buffer is refused rather "
+		m2m_log('E', "ENC", "an indexed draw with no index buffer is refused rather "
 		         "than drawn as if the indices were 0, 1, 2, ...\n");
 		return;
 	}
@@ -7133,7 +7906,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 	indirectBuffer:(id)indirectBuffer
   indirectBufferOffset:(NSUInteger)offset
 {
-	rw_print("an indirect draw is not implemented (the argument list would "
+	m2m_log('W', "ENC", "an indirect draw is not implemented (the argument list would "
 	         "be read on the processor at encode time, and the GPU may not have written it "
 	         "yet), so this draw is refused rather than drawn from the wrong count\n");
 }
@@ -7153,7 +7926,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 - (void)setViewports:(const MTLViewport *)viewports count:(NSUInteger)count
 {
 	if (count > 1 && !_complained) {
-		rw_print("%lu viewports are not implemented; the first one is "
+		m2m_log('W', "ENC", "%lu viewports are not implemented; the first one is "
 		         "taken\n", (unsigned long)count);
 		_complained = YES;
 	}
@@ -7174,7 +7947,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 - (void)setDepthClipMode:(NSUInteger)mode
 {
 	if (mode != MTLDepthClipModeClip && !_complained) {
-		rw_print("MTLDepthClipModeClamp is not implemented; this pass clips "
+		m2m_log('W', "ENC", "MTLDepthClipModeClamp is not implemented; this pass clips "
 		         "against the depth range instead of clamping to it\n");
 		_complained = YES;
 	}
@@ -7248,7 +8021,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 - (void)useResource:(id)resource usage:(NSUInteger)usage
 {
 	(void)resource; (void)usage;
-	RW_ONCE("-useResource: is a no-op here: every member of an argument "
+	RW_ONCE('I', "ENC", "-useResource: is a no-op here: every member of an argument "
 		"buffer is bound explicitly from what the encoder recorded, so there is no "
 		"residency to arrange and no handle for the GPU to follow\n");
 }
@@ -7266,7 +8039,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 - (void)useHeap:(id)heap
 {
 	(void)heap;
-	RW_ONCE("-useHeap: is a no-op here, for -useResource:'s reason, and "
+	RW_ONCE('I', "ENC", "-useHeap: is a no-op here, for -useResource:'s reason, and "
 		"this driver has no heaps to make resident in any case\n");
 }
 - (void)useHeap:(id)heap stages:(NSUInteger)stages             { (void)heap; (void)stages; }
@@ -7369,7 +8142,7 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
  * paid for twice (docs/metal.md 10.21, 10.26). */
 - (void)redwoodNoTessellation
 {
-	RW_ONCE("tessellation is not implemented; this patch draw records "
+	RW_ONCE('W', "ENC", "tessellation is not implemented; this patch draw records "
 		"nothing\n");
 }
 - (void)drawPatches:(NSUInteger)controlPoints
@@ -7439,7 +8212,7 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
  * does not take; the draws in it would be lost silently if it did. */
 - (void)redwoodNoIndirectCommands
 {
-	RW_ONCE("indirect command buffers are not implemented; the commands in "
+	RW_ONCE('W', "ENC", "indirect command buffers are not implemented; the commands in "
 		"this one are not executed\n");
 }
 - (void)executeCommandsInBuffer:(id)buffer withRange:(NSRange)range
@@ -7461,7 +8234,7 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
  * refusing: a tile dispatch would then run with half its bindings. */
 - (void)redwoodNoTileShading
 {
-	RW_ONCE("tile shading and imageblocks are not implemented; this tile "
+	RW_ONCE('W', "ENC", "tile shading and imageblocks are not implemented; this tile "
 		"binding or dispatch is dropped\n");
 }
 - (void)dispatchThreadsPerTile:(MTLSize)size
@@ -7540,7 +8313,7 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
  * would be a table a shader cannot call. */
 - (void)redwoodNoFunctionTables
 {
-	RW_ONCE("visible and intersection function tables are not implemented; "
+	RW_ONCE('W', "ENC", "visible and intersection function tables are not implemented; "
 		"this binding is dropped\n");
 }
 - (void)setVertexVisibleFunctionTable:(id)table atBufferIndex:(NSUInteger)index
@@ -7610,7 +8383,7 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 - (void)setLineWidth:(float)width
 {
 	if (width != 1.0f) {
-		RW_ONCE("a line width of %g is not implemented; lines are one "
+		RW_ONCE('W', "ENC", "a line width of %g is not implemented; lines are one "
 			"pixel wide\n", (double)width);
 	}
 }
@@ -7621,7 +8394,7 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 - (void)setVertexAmplificationMode:(NSUInteger)mode value:(NSUInteger)value
 {
 	if (value > 1) {
-		RW_ONCE("vertex amplification to %lu views is not implemented; "
+		RW_ONCE('W', "ENC", "vertex amplification to %lu views is not implemented; "
 			"this pass draws one\n", (unsigned long)value);
 	}
 	(void)mode;
@@ -7659,7 +8432,7 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
  */
 - (void)redwoodNoMeshStages
 {
-	RW_ONCE("mesh and object shader stages are not implemented (the device "
+	RW_ONCE('W', "ENC", "mesh and object shader stages are not implemented (the device "
 		"answers no to them); this binding is dropped\n");
 }
 - (void)setObjectBuffer:(id)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
@@ -7849,7 +8622,7 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 - (void)addSplitHandler:(void (^)(id, NSUInteger, NSUInteger))handler
 {
 	(void)handler;
-	RW_ONCE("a render-pass split handler was installed; this driver never "
+	RW_ONCE('W', "ENC", "a render-pass split handler was installed; this driver never "
 		"splits a pass, so it will not be called\n");
 }
 
@@ -7918,6 +8691,10 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 		work->clearsStencil = _clearsStencil;
 		work->pass = _pass;
 		work->level = _level[0];
+		memcpy(work->colorLevel, _level, sizeof(work->colorLevel));
+		memcpy(work->colorSlice, _slice, sizeof(work->colorSlice));
+		work->depthLevel = _depthLevel;
+		work->depthSlice = _depthSlice;
 		work->loadAction = _load[0];
 		work->storeAction = _store[0];
 		[_commandBuffer recordWork:work];
@@ -8188,7 +8965,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 
 - (void)forwardInvocation:(NSInvocation *)invocation
 {
-	rw_print("the blit encoder has no %s: ignored\n", sel_getName([invocation selector]));
+	m2m_log('W', "ENC", "the blit encoder has no %s: ignored\n", sel_getName([invocation selector]));
 }
 
 - (void)endEncoding
@@ -8230,7 +9007,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 - (void)setBuffer:(id)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
 	if (index >= RW_MAX_BUFFERS) {
-		rw_print("buffer index %lu is past this driver's %d\n",
+		m2m_log('E', "ENC", "buffer index %lu is past this driver's %d\n",
 		         (unsigned long)index, RW_MAX_BUFFERS);
 		return;
 	}
@@ -8251,7 +9028,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 - (void)setTexture:(id)texture atIndex:(NSUInteger)index
 {
 	if (index >= RW_MAX_BUFFERS) {
-		rw_print("texture index %lu is past this driver's %d\n",
+		m2m_log('E', "ENC", "texture index %lu is past this driver's %d\n",
 		         (unsigned long)index, RW_MAX_BUFFERS);
 		return;
 	}
@@ -8271,7 +9048,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 - (void)setSamplerState:(id)sampler atIndex:(NSUInteger)index
 {
 	if (index >= RW_MAX_BUFFERS) {
-		rw_print("sampler index %lu is past this driver's %d\n",
+		m2m_log('E', "ENC", "sampler index %lu is past this driver's %d\n",
 		         (unsigned long)index, RW_MAX_BUFFERS);
 		return;
 	}
@@ -8290,7 +9067,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 		atIndex:(NSUInteger)index
 {
 	if (!_complained && (lodMin != 0.0f || lodMax < 1000.0f)) {
-		rw_print("a per-binding lod clamp (%g..%g) is not implemented; the "
+		m2m_log('W', "ENC", "a per-binding lod clamp (%g..%g) is not implemented; the "
 		         "sampler's own range is used instead\n", (double)lodMin, (double)lodMax);
 		_complained = YES;
 	}
@@ -8320,7 +9097,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 	RedwoodMetalWork *work = [[RedwoodMetalWork alloc] init];
 
 	if (_pipeline == nil || _complained) {
-		rw_print("this dispatch has %s and is dropped\n",
+		m2m_log('E', "ENC", "this dispatch has %s and is dropped\n",
 		         _pipeline == nil ? "no pipeline state" : "a binding this driver refused");
 		[work release];
 		return;
@@ -8359,7 +9136,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 	if (size.width == 0 || size.height == 0 || size.depth == 0 ||
 	    threads.width % size.width != 0 || threads.height % size.height != 0 ||
 	    threads.depth % size.depth != 0) {
-		rw_print("%lux%lux%lu threads do not divide into groups of "
+		m2m_log('E', "ENC", "%lux%lux%lu threads do not divide into groups of "
 		         "%lux%lux%lu, and this driver does not have the partial-group support "
 		         "that would need\n", (unsigned long)threads.width,
 		         (unsigned long)threads.height, (unsigned long)threads.depth,
@@ -8397,7 +9174,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 - (void)setBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
 	if (index >= RW_MAX_BUFFERS) {
-		rw_print("buffer index %lu is past this driver's %d\n",
+		m2m_log('E', "ENC", "buffer index %lu is past this driver's %d\n",
 		         (unsigned long)index, RW_MAX_BUFFERS);
 		return;
 	}
@@ -8459,13 +9236,13 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 			 threadsPerThreadgroup:(MTLSize)size
 {
 	(void)buffer; (void)offset; (void)size;
-	RW_ONCE("an indirect dispatch is not implemented (the grid lives in GPU "
+	RW_ONCE('W', "ENC", "an indirect dispatch is not implemented (the grid lives in GPU "
 		"memory and this driver records the grid); this dispatch is dropped\n");
 }
 - (void)executeCommandsInBuffer:(id)buffer withRange:(NSRange)range
 {
 	(void)buffer; (void)range;
-	RW_ONCE("indirect command buffers are not implemented; the commands in "
+	RW_ONCE('W', "ENC", "indirect command buffers are not implemented; the commands in "
 		"this one are not executed\n");
 }
 - (void)executeCommandsInBuffer:(id)buffer
@@ -8473,14 +9250,14 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 	   indirectBufferOffset:(NSUInteger)offset
 {
 	(void)buffer; (void)indirectBuffer; (void)offset;
-	RW_ONCE("indirect command buffers are not implemented; the commands in "
+	RW_ONCE('W', "ENC", "indirect command buffers are not implemented; the commands in "
 		"this one are not executed\n");
 }
 /* The stage-in region is for a kernel whose arguments arrive as [[stage_in]] -- the
  * non-uniform-grid feature. Nothing in the AIR this driver compiles declares one. */
 - (void)redwoodNoStageIn
 {
-	RW_ONCE("a kernel stage-in region is not implemented; the dispatch "
+	RW_ONCE('W', "ENC", "a kernel stage-in region is not implemented; the dispatch "
 		"covers the whole grid it was given\n");
 }
 - (void)setStageInRegion:(MTLRegion)region
@@ -8497,7 +9274,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 - (void)setImageblockWidth:(NSUInteger)width height:(NSUInteger)height
 {
 	(void)width; (void)height;
-	RW_ONCE("imageblocks are not implemented; this kernel's imageblock "
+	RW_ONCE('W', "ENC", "imageblocks are not implemented; this kernel's imageblock "
 		"size is ignored\n");
 }
 /* An entry for this exists in _MTLCommandEncoder and it is one of Apple's abstract ones
@@ -8508,7 +9285,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 
 - (void)redwoodNoFunctionTables
 {
-	RW_ONCE("visible and intersection function tables are not implemented; "
+	RW_ONCE('W', "ENC", "visible and intersection function tables are not implemented; "
 		"this binding is dropped\n");
 }
 - (void)setVisibleFunctionTable:(id)table atBufferIndex:(NSUInteger)index
@@ -8588,14 +9365,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
  * it sends anything, and the protocol is only in the process once Metal is. Every method
  * it requires is answered below -- some of them by declining out loud, which is an answer
  * and not an absence. */
-+ (void)load
-{
-	Protocol *p = objc_getProtocol("MTLArgumentEncoder");
-
-	if (p != NULL && !class_conformsToProtocol(self, p) && !class_addProtocol(self, p)) {
-		rw_print("class_addProtocol(MTLArgumentEncoder) refused\n");
-	}
-}
+/* (its MTLArgumentEncoder conformance is declared with the others: rw_declare_protocols) */
 
 - (instancetype)initWithRedwoodDevice:(RedwoodMetalDevice *)device
 			       layout:(const struct rwa_argbuf_layout *)layout
@@ -8664,7 +9434,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 - (void)setArgumentBuffer:(id)buffer offset:(NSUInteger)offset
 {
 	if (buffer != nil && ![buffer isKindOfClass:[RedwoodMetalBuffer class]]) {
-		rw_print("the argument buffer is a %s and not one of ours, so "
+		m2m_log('E', "ENC", "the argument buffer is a %s and not one of ours, so "
 		         "nothing can be encoded into it\n",
 		         class_getName(object_getClass(buffer)));
 		[_destination release];
@@ -8672,14 +9442,14 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 		return;
 	}
 	if (buffer != nil && [buffer mesaBuffer] == NULL) {
-		rw_print("the argument buffer did not come from the compiler "
+		m2m_log('E', "ENC", "the argument buffer did not come from the compiler "
 		         "library, so nothing can be encoded into it\n");
 		[_destination release];
 		_destination = nil;
 		return;
 	}
 	if (buffer != nil && _layout.alignment != 0 && offset % _layout.alignment != 0) {
-		rw_print("an argument buffer offset of %lu is not a multiple of "
+		m2m_log('E', "ENC", "an argument buffer offset of %lu is not a multiple of "
 		         "this encoder's alignment (%u), so the draw would look for the "
 		         "encoding somewhere else\n", (unsigned long)offset, _layout.alignment);
 		[_destination release];
@@ -8716,7 +9486,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 {
 	if (_destination == nil) {
 		if (!_complained) {
-			rw_print("%s was encoded at id %lu with no argument buffer "
+			m2m_log('E', "ENC", "%s was encoded at id %lu with no argument buffer "
 			         "set (Metal's -setArgumentBuffer:offset: has to name one "
 			         "first)\n", what, (unsigned long)index);
 			_complained = YES;
@@ -8728,7 +9498,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 		 * shader's set is the shader's business and an application cannot change
 		 * it, while a set described with MTLArgumentDescriptors is the
 		 * application's own and the id it just used is one it did not describe. */
-		rw_print("%s was encoded at id %lu of %s that declares %u member%s\n", what,
+		m2m_log('E', "ENC", "%s was encoded at id %lu of %s that declares %u member%s\n", what,
 		         (unsigned long)index,
 		         _fromModule ? "a set a shader declares" : "an encoder this "
 		                       "application described",
@@ -8755,14 +9525,14 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 		return;
 	}
 	if (buffer != nil && ![buffer isKindOfClass:[RedwoodMetalBuffer class]]) {
-		rw_print("the buffer encoded at id %lu is a %s and not one of "
+		m2m_log('E', "ENC", "the buffer encoded at id %lu is a %s and not one of "
 		         "ours\n", (unsigned long)index,
 		         class_getName(object_getClass(buffer)));
 		return;
 	}
 	if (mesa.argbuf_encode_buffer([_destination mesaBuffer], _offset, (unsigned)index,
 				      [buffer mesaBuffer], offset, why, sizeof(why)) != 0) {
-		rw_print("%s\n", why);
+		m2m_log('E', "ENC", "%s\n", why);
 	}
 }
 
@@ -8784,14 +9554,14 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 		return;
 	}
 	if (texture != nil && ![texture isKindOfClass:[RedwoodMetalTexture class]]) {
-		rw_print("the texture encoded at id %lu is a %s and not one of "
+		m2m_log('E', "ENC", "the texture encoded at id %lu is a %s and not one of "
 		         "ours\n", (unsigned long)index,
 		         class_getName(object_getClass(texture)));
 		return;
 	}
 	if (mesa.argbuf_encode_texture([_destination mesaBuffer], _offset, (unsigned)index,
 				       [texture mesaTexture], why, sizeof(why)) != 0) {
-		rw_print("%s\n", why);
+		m2m_log('E', "ENC", "%s\n", why);
 	}
 }
 
@@ -8810,14 +9580,14 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 		return;
 	}
 	if (sampler != nil && ![sampler isKindOfClass:[RedwoodMetalSampler class]]) {
-		rw_print("the sampler encoded at id %lu is a %s and not one of "
+		m2m_log('E', "ENC", "the sampler encoded at id %lu is a %s and not one of "
 		         "ours\n", (unsigned long)index,
 		         class_getName(object_getClass(sampler)));
 		return;
 	}
 	if (mesa.argbuf_encode_sampler([_destination mesaBuffer], _offset, (unsigned)index,
 				       [sampler mesaSampler], why, sizeof(why)) != 0) {
-		rw_print("%s\n", why);
+		m2m_log('E', "ENC", "%s\n", why);
 	}
 }
 
@@ -8851,7 +9621,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 	if (bytes == NULL) {
 		return NULL;
 	}
-	RW_ONCE("-constantDataAtIndex: hands back the argument buffer's own "
+	RW_ONCE('I', "ENC", "-constantDataAtIndex: hands back the argument buffer's own "
 		"bytes, and nothing in this driver reads them: a shader that reads a VALUE "
 		"out of an argument buffer is refused when it is translated, because every "
 		"member this frontend binds is a descriptor\n");
@@ -8866,7 +9636,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
  */
 - (id)newArgumentEncoderForBufferAtIndex:(NSUInteger)index
 {
-	rw_print("-newArgumentEncoderForBufferAtIndex:%lu asks for an encoder for "
+	m2m_log('W', "ENC", "-newArgumentEncoderForBufferAtIndex:%lu asks for an encoder for "
 	         "a set INSIDE a set, and this port's frontend refuses a nested argument buffer "
 	         "when it translates the shader, so there is nothing to encode for\n",
 	         (unsigned long)index);
@@ -8882,7 +9652,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
  */
 - (void)redwoodNoSuchMember:(const char *)what atIndex:(NSUInteger)index
 {
-	rw_print("%s was encoded at id %lu of an argument buffer, and this port "
+	m2m_log('E', "ENC", "%s was encoded at id %lu of an argument buffer, and this port "
 	         "binds a buffer, a texture or a sampler member and refuses the rest when the "
 	         "shader is translated; this encoding is dropped\n", what, (unsigned long)index);
 }
@@ -8997,7 +9767,7 @@ rw_function_argument_encoder(id self, SEL cmd, NSUInteger index)
 
 	(void)cmd;
 	if (![device isKindOfClass:[RedwoodMetalDevice class]]) {
-		rw_print("-newArgumentEncoderWithBufferIndex: on a function whose device is "
+		m2m_log('E', "ENC", "-newArgumentEncoderWithBufferIndex: on a function whose device is "
 		         "a %s and not ours\n", class_getName(object_getClass(device)));
 		return nil;
 	}

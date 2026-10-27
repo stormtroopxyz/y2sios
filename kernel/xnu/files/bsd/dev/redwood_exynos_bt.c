@@ -314,18 +314,36 @@ bt_deliver(void)
 	}
 }
 
+/*
+ * The interrupt wakes it; every 100 ms besides, so that nothing is left behind a missed one -- counted:
+ * bt_rescued, the looks that found bytes the interrupt had not brought (it was every 2 ms: some 500
+ * wake-ups a second with nothing to do, the cpuidle wake record, 27 October).
+ */
+static uint64_t bt_rescued, bt_safety_looks;
+
 static void
 bt_reader(__unused void *arg, __unused wait_result_t wr_)
 {
+	wait_result_t why = THREAD_AWAKENED;
+
 	for (;;) {
+		uint32_t before = ring_count();
+
 		lck_mtx_lock(&bt_lock);
 		uart_drain();
 		lck_mtx_unlock(&bt_lock);
+		if (why == THREAD_TIMED_OUT) {
+			bt_safety_looks++;
+			if (ring_count() != before) {
+				bt_rescued++;
+				printf("bt: the 100 ms look found %u bytes no interrupt had brought (%llu times of %llu looks)\n",
+				    ring_count() - before, bt_rescued, bt_safety_looks);
+			}
+		}
 		bt_deliver();
 		wr(UINTM, rd(UINTM) & ~(UINT_RXD | UINT_ERROR));
-		/* the interrupt wakes it; 2 ms besides, so that nothing is left behind a missed one */
-		assert_wait_timeout((event_t)&bt_event, THREAD_UNINT, 2, NSEC_PER_MSEC);
-		thread_block(THREAD_CONTINUE_NULL);
+		assert_wait_timeout((event_t)&bt_event, THREAD_UNINT, 100, NSEC_PER_MSEC);
+		why = thread_block(THREAD_CONTINUE_NULL);
 	}
 }
 

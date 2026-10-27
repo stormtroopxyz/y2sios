@@ -72,6 +72,7 @@
 #include <string.h>
 
 #include "redwood_drawable.h"
+#include "m2m.h"
 
 /*
  * The two requests this file needs, by the numbers the kernel answers them on
@@ -161,7 +162,7 @@ rwd_shared_connection(void)
 		opened = 1;
 		if (rwd_gpu_open(&connection, why, sizeof(why)) != 0) {
 			connection = 0;
-			printf("redwooddrawable: %s\n", why);
+			m2m_log('E', "SURF", "drawable: the GPU service: %s", why);
 		}
 	}
 	return connection;
@@ -293,8 +294,8 @@ rwd_surface_id(void *iosurface)
 		*(void **)&get_id = dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
 		looked = 1;
 		if (get_id == NULL) {
-			printf("redwooddrawable: this process has no IOSurfaceGetID, so a "
-			       "surface cannot be named to the kernel\n");
+			m2m_log('E', "SURF", "drawable: this process has no IOSurfaceGetID, so a "
+			        "surface cannot be named to the kernel");
 		}
 	}
 	return get_id != NULL ? get_id(iosurface) : 0;
@@ -546,8 +547,8 @@ rwd_import(void)
 			*(void **)&import = dlsym(library, "rwa_texture_from_surface");
 			*(void **)&rwd_import_planes = dlsym(library, "rwa_texture_from_surface_planes");
 		}
-		printf("redwooddrawable: the compiler library %s, and %s "
-		       "rwa_texture_from_surface\n",
+		m2m_log(import != NULL ? 'I' : 'E', "SURF", "drawable: the compiler library %s, and %s "
+		        "rwa_texture_from_surface",
 		    library != NULL ? "is loaded in this process" : "is not loaded here",
 		    import != NULL ? "has" : "has NOT");
 	}

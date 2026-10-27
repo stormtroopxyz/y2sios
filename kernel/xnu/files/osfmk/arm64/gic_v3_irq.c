@@ -221,10 +221,22 @@ gic_v3_spi_unmask(uint32_t intid)
  * before the interrupt is ended; for a level-triggered one it has to quiet the source or mask the
  * interrupt (gic_v3_spi_mask()). Thread context.
  */
+kern_return_t gic_v3_spi_attach_to(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid),
+    void *context, int cpu);
+
 kern_return_t
 gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context)
 {
-	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
+	return gic_v3_spi_attach_to(intid, edge, handler, context, -1);
+}
+
+/* ... routed to processor `cpu` (cpu_number(); -1: this one) instead (a per-core timer: psci_smp.c's cpuidle) */
+kern_return_t
+gic_v3_spi_attach_to(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context,
+    int cpu)
+{
+	uint64_t mpidr = cpu < 0 ? __builtin_arm_rsr64("MPIDR_EL1") : cpu_datap(cpu)->cpu_phys_id;
+
 	struct gic_spi *slot = NULL;
 	uint32_t config;
 
@@ -413,6 +425,36 @@ gic_find_redistributor(void)
 }
 
 /* Per-CPU bring-up: every processor calls this for itself, the boot processor first. */
+/*
+ * The CPU interface again, on a core back from a power-down (PSCI CPU_SUSPEND, psci_smp.c's cpuidle): its
+ * system registers were lost with it, the distributor's and redistributor's state was not (Linux's GICv3
+ * cpu_pm exit does the same: gic_cpu_sys_reg_init). The redistributor is woken if the firmware left it asleep.
+ */
+void gic_v3_irq_cpu_resume(void);
+void
+gic_v3_irq_cpu_resume(void)
+{
+	vm_offset_t gicr = gicr_cpu_base[cpu_number()];
+
+	__builtin_arm_wsr64("ICC_SRE_EL1", __builtin_arm_rsr64("ICC_SRE_EL1") | 1);
+	__builtin_arm_isb(ISB_SY);
+	if (gicr != 0) {
+		uint32_t waker = gic_read32(gicr + GICR_WAKER);
+
+		if (waker & GICR_WAKER_PROCSLEEP) {
+			gic_write32(gicr + GICR_WAKER, waker & ~GICR_WAKER_PROCSLEEP);
+			while (gic_read32(gicr + GICR_WAKER) & GICR_WAKER_CHILDASLEEP) {
+				/* spin until the redistributor is awake */
+			}
+		}
+	}
+	__builtin_arm_wsr64("ICC_AP1R0_EL1", 0);
+	__builtin_arm_wsr64("ICC_PMR_EL1", 0xff);
+	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
+	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
+	__builtin_arm_isb(ISB_SY);
+}
+
 void
 gic_v3_irq_cpu_init(void)
 {

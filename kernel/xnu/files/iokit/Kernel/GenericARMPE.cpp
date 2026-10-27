@@ -29,6 +29,9 @@ extern uint32_t processor_avail_count;
 
 /* osfmk/arm64/psci_smp.c and gic_v3_irq.c */
 void psci_smp_init(void);
+void redwood_m2m_cores(void);                  /* bsd/dev/redwood_m2m.c */
+void redwood_jit_flush_init(void);             /* osfmk/arm64/cpu.c */
+void redwood_cpuidle_init(void);               /* osfmk/arm64/psci_smp.c */
 kern_return_t psci_smp_start_cpu(int cpu);
 void psci_smp_cpu_running(void);
 void psci_smp_cpu_off(void) __dead2;
@@ -102,6 +105,13 @@ GenericARMCPU::start(IOService * provider)
 	info.phys_id = physID;
 	info.cluster_id = topology->cluster_id;
 	info.cluster_type = topology->cluster_type;
+	/*
+	 * How long the core takes to come back from being power-gated: the dtb's c2 idle states, exit-latency-us
+	 * (ananke 160, enyo 190, lion 220; cores 0-3, 4-5, 6-7). XNU spins rather than sleeps in a delay() shorter
+	 * than this (ml_delay_should_spin); left 0, every delay -- 10 us register polls, an I2C bit -- blocked on a
+	 * timer and switched threads twice (the cpuidle wake record, 27 October: some 1000 a second from sound alone).
+	 */
+	info.powergate_latency = cpu < 4 ? 160000 : cpu < 6 ? 190000 : 220000;
 	if (ml_processor_register(&info, &machProcessor, &ipi_handler, &pmi_handler) != KERN_SUCCESS) {
 		IOLog("GenericARMCPU: ml_processor_register failed\n");
 		return false;
@@ -286,6 +296,7 @@ GenericARMPE::start(IOService * provider)
 					}
 				}
 				IOLog("GenericARMPE: the slower cores started too: %u processors running\n", processor_avail_count);
+				redwood_m2m_cores();
 			}, NULL);
 			clock_interval_to_deadline(later, NSEC_PER_SEC, &deadline);
 			thread_call_enter_delayed(later_call, deadline);
@@ -293,6 +304,8 @@ GenericARMPE::start(IOService * provider)
 		if (count > 1) {
 			IOLog("GenericARMPE: %u of %u processors are running\n", processor_avail_count, count);
 		}
+		redwood_jit_flush_init();
+		redwood_cpuidle_init();
 	}
 
 	/* BSD looks the platform expert up by class (IOSecureBSDRoot). */

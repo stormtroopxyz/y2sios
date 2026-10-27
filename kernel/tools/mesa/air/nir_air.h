@@ -318,6 +318,16 @@ struct air_shader_info {
    const char **notes;
 
    unsigned threadgroup_bytes; /* static threadgroup memory */
+
+   /* Metal's is_null_texture(t), which asks whether anything is bound at t's slot -- a
+    * question about the binding and not the shader, so it is answered at run time: the
+    * shader reads bit n of the first word of constant buffer null_query_ubo - 1 (an index
+    * no `constant` argument of the shader uses), which the runtime fills with the slots it
+    * bound. null_query_textures is the slots the shader asks about; a slot asked about may
+    * be left unbound, which is the point of asking. Both 0 when the shader asks nothing.
+    */
+   uint32_t null_query_textures;
+   unsigned null_query_ubo;
 };
 
 /* The word, field by field. A runtime that holds only `sampler_state` can call

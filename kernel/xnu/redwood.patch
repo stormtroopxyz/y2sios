@@ -81,10 +81,10 @@ index 4b83160780c3..b6e8ed633c1d 100644
  
  #
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..0398f4e0fd6d 100644
+index 44274016a4cf..40ec8d165585 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,50 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,51 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -96,6 +96,7 @@ index 44274016a4cf..0398f4e0fd6d 100644
 +bsd/dev/redwood_exynos_keys.c	standard
 +bsd/dev/redwood_perf.c	standard
 +bsd/dev/redwood_logd.c	standard
++bsd/dev/redwood_m2m.c	standard
 +bsd/dev/redwood_max77705.c	standard
 +bsd/dev/redwood_mali.c	standard
 +bsd/dev/redwood_buttons.c	standard
@@ -135,7 +136,7 @@ index 44274016a4cf..0398f4e0fd6d 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +199,53 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +200,53 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -189,7 +190,7 @@ index 44274016a4cf..0398f4e0fd6d 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +452,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +453,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -197,7 +198,7 @@ index 44274016a4cf..0398f4e0fd6d 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +475,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +476,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -819,6 +820,26 @@ index 1d71c66629fb..3e1737c21b86 100644
  	if (0 == error) {
  		/*
  		 * Update the new process's signature-dependent process state.
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index 1161432246f9..37a5c314cfd0 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -184,6 +184,7 @@ int proc_list_uptrs(void *p, uint64_t *udata_buffer, int size);
+ extern uint64_t task_corpse_get_crashed_thread_id(task_t corpse_task);
+ 
+ extern unsigned int exception_log_max_pid;
++extern void redwood_m2m_proc_exit(int pid, const char *comm, int status);       /* bsd/dev/redwood_m2m.c */
+ 
+ extern void IOUserServerRecordExitReason(task_t task, os_reason_t reason);
+ 
+@@ -2138,6 +2139,7 @@ proc_exit(proc_t p)
+ 	proc_unlock(p);
+ 	pid = proc_getpid(p);
+ 	exitval = p->p_xstat;
++	redwood_m2m_proc_exit(pid, p->p_comm, exitval);       /* a Metal client's end, in mali2metal's channel */
+ 	KERNEL_DEBUG_CONSTANT_IST(KDEBUG_COMMON,
+ 	    BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_EXIT) | DBG_FUNC_START,
+ 	    pid, exitval, 0, 0, 0);
 diff --git a/bsd/kern/kern_memorystatus.c b/bsd/kern/kern_memorystatus.c
 index 1750d3a52d3c..9947cb2421da 100644
 --- a/bsd/kern/kern_memorystatus.c
@@ -1203,6 +1224,69 @@ index 74a2036cf69e..a68b79ce48fa 100644
  
  #define UIO_IS_USER_SPACE32( a_uio_t )  \
  	( (a_uio_t)->uio_segflg == UIO_USERSPACE32 || (a_uio_t)->uio_segflg == UIO_PHYS_USERSPACE32 || \
+diff --git a/bsd/uxkern/ux_exception.c b/bsd/uxkern/ux_exception.c
+index 1780c2a20b36..0306b5f849ae 100644
+--- a/bsd/uxkern/ux_exception.c
++++ b/bsd/uxkern/ux_exception.c
+@@ -44,6 +44,7 @@
+ #include <sys/vmparam.h>        /* MAXSSIZ */
+ 
+ #include <sys/ux_exception.h>
++#include <sys/redwood_m2m.h>
+ 
+ /*
+  * Translate Mach exceptions to UNIX signals.
+@@ -172,6 +173,50 @@ handle_ux_exception(thread_t                    thread,
+ 		}
+ 	}
+ 
++	/*
++	 * (redwood) Every fault that becomes SIGILL, SIGSEGV or SIGBUS, in any process, into the mali2metal
++	 * channel: the core it ran on decides whether a fault belongs to one kind of core (the M5s, PLANS/
++	 * 10-mali2metal.md), and the instruction word names what a SIGILL refused. A fault a process handles
++	 * itself (WebAssembly's bounds) is recorded the same way: this is the fault, not the death.
++	 */
++	if ((ux_signal == SIGILL || ux_signal == SIGSEGV || ux_signal == SIGBUS) && thread == current_thread()) {
++		extern void redwood_user_fault(thread_t, uint64_t *, uint64_t *, uint64_t *, uint32_t *, unsigned *,
++		    uint32_t *);
++		extern bool redwood_shared_cache_unslide(task_t, uint64_t, uint64_t *);
++		uint64_t pc, lr, far, cache_pc = 0, cache_lr = 0;
++		uint32_t esr, midr, insn = 0;
++		unsigned cpu;
++		char comm[MAXCOMLEN + 1], where[64] = "";
++		bool have_insn;
++
++		redwood_user_fault(thread, &pc, &lr, &far, &esr, &cpu, &midr);
++		have_insn = copyin((user_addr_t)pc, &insn, sizeof(insn)) == 0;
++		if (redwood_shared_cache_unslide(proc_task(p), pc, &cache_pc)) {
++			snprintf(where, sizeof(where), " [cache 0x%llx]", cache_pc);
++		}
++		if (redwood_shared_cache_unslide(proc_task(p), lr, &cache_lr)) {
++			snprintf(where + strlen(where), sizeof(where) - strlen(where), " lr [cache 0x%llx]", cache_lr);
++		}
++		proc_name(proc_getpid(p), comm, sizeof(comm));
++		m2m_klog_for(proc_getpid(p), comm, 'E', "CRASH", "fault: signal %d (exception %d code 0x%llx sub 0x%llx) "
++		    "pc 0x%llx lr 0x%llx far 0x%llx esr 0x%x insn %s%08x%s on cpu %u (midr 0x%x)", ux_signal, exception,
++		    (unsigned long long)code, (unsigned long long)subcode, pc, lr, far, esr, have_insn ? "" : "?",
++		    insn, where, cpu, midr);
++		{
++			/* what that core's instruction cache had been through (cpuidle, jit_flush): for telling the causes apart */
++			extern uint64_t redwood_cpuidle_resumed_at[8], redwood_icache_local_at[8], redwood_icache_range_at;
++			uint64_t now = mach_absolute_time(), up = 0, local = 0, range = 0;
++			unsigned c = cpu < 8 ? cpu : 0;
++
++			absolutetime_to_nanoseconds(redwood_cpuidle_resumed_at[c] ? now - redwood_cpuidle_resumed_at[c] : 0, &up);
++			absolutetime_to_nanoseconds(redwood_icache_local_at[c] ? now - redwood_icache_local_at[c] : 0, &local);
++			absolutetime_to_nanoseconds(redwood_icache_range_at ? now - redwood_icache_range_at : 0, &range);
++			m2m_klog_for(proc_getpid(p), comm, 'E', "CRASH", "fault context: cpu %u back from a power-down %llu us ago%s, "
++			    "its last range invalidation %llu us ago, the last range (any core) %llu us ago", cpu, up / 1000,
++			    redwood_cpuidle_resumed_at[c] ? "" : " (never)", local / 1000, range / 1000);
++		}
++	}
++
+ 	/* Send signal to thread */
+ 	if (ux_signal != 0) {
+ 		ut->uu_exception = exception;
 diff --git a/bsd/vfs/vfs_attrlist.c b/bsd/vfs/vfs_attrlist.c
 index cbaa0b221894..78315a2d54cf 100644
 --- a/bsd/vfs/vfs_attrlist.c
@@ -1865,10 +1949,10 @@ index 5219fb0d9ed6..d88015b06b3a 100644
  //	Now check if we are trying to root on a memory device
  //
 diff --git a/iokit/conf/files b/iokit/conf/files
-index 5fb0a52062e0..a07071e5d951 100644
+index 5fb0a52062e0..be51e603cf3d 100644
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -79,6 +79,15 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
+@@ -79,6 +79,16 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
  iokit/Kernel/IOGuardPageMemoryDescriptor.cpp		optional iokitcpp
  
  iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
@@ -1879,6 +1963,7 @@ index 5fb0a52062e0..a07071e5d951 100644
 +iokit/Kernel/RedwoodMali.cpp				optional iokitcpp
 +iokit/Kernel/RedwoodWLAN.cpp			optional iokitcpp
 +iokit/Kernel/RedwoodBattery.cpp			optional iokitcpp
++iokit/Kernel/RedwoodStorage.cpp			optional iokitcpp
 +iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
 +iokit/Kernel/MiniIONetworkStack.cpp			optional iokitcpp
  iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
@@ -2026,7 +2111,7 @@ index 0316792a3f42..823e541c03b1 100644
  # Assume LTO scaling by default, unless it is being explicitly passed on the command-line
  LARGE_BUILD_FOOTPRINT := $(if $(BUILD_LTO),$(BUILD_LTO),1)
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e26a1d70f470..f91095c98d26 100644
+index e26a1d70f470..5096c529e79b 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
 @@ -73,6 +73,9 @@
@@ -2185,6 +2270,19 @@ index e26a1d70f470..f91095c98d26 100644
  
  #if APPLE_ARM64_ARCH_FAMILY
  	configure_late_apple_regs();
+@@ -823,5 +856,12 @@ arm_init_idle_cpu(
+ 
+ 	fiq_context_init(FALSE);
+ 
++#if defined(GENERIC_PSCI_SMP)
++	{
++		extern void redwood_cpuidle_resumed(void);
++
++		redwood_cpuidle_resumed();      /* (a core back from PSCI CPU_SUSPEND: psci_smp.c) */
++	}
++#endif
+ 	cpu_idle_exit(TRUE);
+ }
 diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
 index 39daaf8db949..64ceb1a5f201 100644
 --- a/osfmk/arm/model_dep.c
@@ -2309,7 +2407,7 @@ index b9549da357b4..cca31ea32502 100644
  #else
  #define __USES_V_CRYPTO_INTRINSICS 0
 diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
-index 94e91306b143..b0e3f2f9eaa2 100644
+index 94e91306b143..7e0bb957daf9 100644
 --- a/osfmk/arm64/cpu.c
 +++ b/osfmk/arm64/cpu.c
 @@ -568,7 +568,12 @@ cpu_idle(void)
@@ -2326,7 +2424,23 @@ index 94e91306b143..b0e3f2f9eaa2 100644
  		platform_cache_idle_enter();
  #endif
  
-@@ -673,6 +678,38 @@ cpu_idle_exit(boolean_t from_reset)
+@@ -587,6 +592,15 @@ cpu_idle(void)
+ 		__builtin_arm_dsb(DSB_SY);
+ #if HAS_RETENTION_STATE
+ 		arm64_retention_wfi();
++#elif defined(GENERIC_PSCI_SMP)
++		{
++			extern bool redwood_cpuidle_enter(void);
++
++			/* a power-down instead, when it is armed and worth it (psci_smp.c); it may not return */
++			if (!redwood_cpuidle_enter()) {
++				__builtin_arm_wfi();
++			}
++		}
+ #else
+ 		__builtin_arm_wfi();
+ #endif
+@@ -673,6 +687,146 @@ cpu_idle_exit(boolean_t from_reset)
  	Idle_load_context();
  }
  
@@ -2336,6 +2450,97 @@ index 94e91306b143..b0e3f2f9eaa2 100644
 + * they are all alike -- what userland is told of the caches (the commpage) comes from the boot core.
 + */
 +extern void loader_log_line(const char *line);
++
++/* each core's line, kept for the mali2metal channel (which starts after the cores do): redwood_cpu_idents */
++#define REDWOOD_IDENT_SLOTS 8
++static char redwood_ident_line[REDWOOD_IDENT_SLOTS][320];
++static uint32_t redwood_ident_count;
++
++void redwood_cpu_idents(void (*each)(const char *line));
++void
++redwood_cpu_idents(void (*each)(const char *line))
++{
++	uint32_t n = os_atomic_load(&redwood_ident_count, acquire);
++
++	for (uint32_t i = 0; i < n && i < REDWOOD_IDENT_SLOTS; i++) {
++		if (redwood_ident_line[i][0] != '\0') {
++			each(redwood_ident_line[i]);
++		}
++	}
++}
++
++/*
++ * The user registers of a thread that took a fault, and the core it took it on (bsd/uxkern/ux_exception.c's
++ * fault record). Called on the faulting thread: the core is the one the instruction ran on.
++ */
++void redwood_user_fault(thread_t thread, uint64_t *pc, uint64_t *lr, uint64_t *far, uint32_t *esr, unsigned *cpu,
++    uint32_t *midr);
++void
++redwood_user_fault(thread_t thread, uint64_t *pc, uint64_t *lr, uint64_t *far, uint32_t *esr, unsigned *cpu,
++    uint32_t *midr)
++{
++	arm_saved_state_t *state = get_user_regs(thread);
++	uint64_t id;
++
++	*pc = state ? get_saved_state_pc(state) : 0;
++	*lr = state ? get_saved_state_lr(state) : 0;
++	*far = state ? get_saved_state_far(state) : 0;
++	*esr = state ? (uint32_t)get_saved_state_esr(state) : 0;
++	*cpu = (unsigned)cpu_number();
++	__asm__ volatile ("mrs %0, MIDR_EL1" : "=r"(id));
++	*midr = (uint32_t)id;
++}
++
++/*
++ * (redwood) jit_flush=1: SCTLR_EL1.UCI cleared on every core, so a user DC CVAU/CVAC/CIVAC/CVAP or IC IVAU
++ * traps and sleh.c's redwood_user_cache_op does it with the data clean IC IVAU needs. iOS's
++ * sys_icache_invalidate (libsystem_platform) issues IC IVAU alone, relying on the data cache being coherent
++ * with instruction fetch as Apple's cores are; the Exynos 990's say they are not (CTR_EL0.IDC 0 on all three
++ * kinds), and JIT-written code ran stale on the M5s (WebContent: SIGILL on valid instructions, ESR class 0 --
++ * PLANS/10-mali2metal.md, run 20). Built into SCTLR_EL1_DEFAULT from the first instruction, the phone reset
++ * itself as SpringBoard came up and left no log (run 21), so it is armed jit_flush_after= seconds after boot
++ * (default 60), when the channel can be read live over Wi-Fi up to whatever happens.
++ */
++bool redwood_jit_flush_on;
++
++void redwood_uci_off(void *arg);
++void
++redwood_uci_off(void *arg __unused)
++{
++	uint64_t sctlr;
++
++	__asm__ volatile ("mrs %0, SCTLR_EL1" : "=r"(sctlr));
++	sctlr &= ~SCTLR_UCI_ENABLED;
++	__asm__ volatile ("msr SCTLR_EL1, %0; isb" : : "r"(sctlr) : "memory");
++}
++
++static void
++redwood_jit_flush_arm(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
++{
++	extern void m2m_klog(char sev, const char *cat, const char *fmt, ...);
++
++	redwood_jit_flush_on = true;
++	__builtin_arm_dsb(DSB_ISH);
++	cpu_broadcast_xcall_simple(TRUE, redwood_uci_off, NULL);
++	m2m_klog('I', "DEV", "jit_flush: user cache maintenance now trapped on every core (SCTLR_EL1.UCI clear)");
++}
++
++void redwood_jit_flush_init(void);
++void
++redwood_jit_flush_init(void)
++{
++	uint32_t on = 0, after = 60;
++	uint64_t deadline;
++	thread_call_t call;
++
++	if (!PE_parse_boot_argn("jit_flush", &on, sizeof(on)) || on != 1) {
++		return;
++	}
++	PE_parse_boot_argn("jit_flush_after", &after, sizeof(after));
++	call = thread_call_allocate(redwood_jit_flush_arm, NULL);
++	clock_interval_to_deadline(after, NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(call, deadline);
++}
 +
 +static void
 +redwood_cpu_ident(void)
@@ -2353,19 +2558,36 @@ index 94e91306b143..b0e3f2f9eaa2 100644
 +	__asm__ volatile ("mrs %0, ID_AA64PFR0_EL1" : "=r"(pfr0));
 +	__asm__ volatile ("mrs %0, ID_AA64MMFR1_EL1" : "=r"(mmfr1));
 +	__asm__ volatile ("mrs %0, ID_AA64MMFR2_EL1" : "=r"(mmfr2));
-+	__asm__ volatile ("msr CSSELR_EL1, %1; isb; mrs %0, CCSIDR_EL1" : "=r"(ccsidr_i) : "r"(1ULL));
-+	__asm__ volatile ("msr CSSELR_EL1, %1; isb; mrs %0, CCSIDR_EL1" : "=r"(ccsidr_d) : "r"(0ULL));
++	/* (each its own statements: the selection written, then the size read) */
++	__asm__ volatile ("msr CSSELR_EL1, %0; isb" : : "r"(1ULL) : "memory");
++	__asm__ volatile ("mrs %0, CCSIDR_EL1" : "=r"(ccsidr_i) : : "memory");
++	__asm__ volatile ("msr CSSELR_EL1, %0; isb" : : "r"(0ULL) : "memory");
++	__asm__ volatile ("mrs %0, CCSIDR_EL1" : "=r"(ccsidr_d) : : "memory");
 +	snprintf(line, sizeof(line), "cpu-ident: mpidr %llx midr %llx ctr %llx (I line %u B, D line %u B, DIC %u IDC %u) "
 +	    "dczid %llx clidr %llx ccsidr L1I %llx L1D %llx isar0 %llx isar1 %llx pfr0 %llx mmfr1 %llx mmfr2 %llx\n",
 +	    mpidr & 0xffffff, midr, ctr, 4u << (ctr & 0xf), 4u << ((ctr >> 16) & 0xf), (unsigned)((ctr >> 29) & 1),
 +	    (unsigned)((ctr >> 28) & 1), dczid, clidr, ccsidr_i, ccsidr_d, isar0, isar1, pfr0, mmfr1, mmfr2);
 +	loader_log_line(line);
++	{
++		extern uint64_t redwood_cpu_mpidr[];
++
++		if (cpu_number() < 8) {
++			redwood_cpu_mpidr[cpu_number()] = mpidr | (1ULL << 63);      /* bit 63: known */
++		}
++	}
++	{
++		uint32_t slot = os_atomic_inc_orig(&redwood_ident_count, relaxed);
++
++		if (slot < REDWOOD_IDENT_SLOTS) {
++			strlcpy(redwood_ident_line[slot], line, sizeof(redwood_ident_line[slot]));
++		}
++	}
 +}
 +
  void
  cpu_init(void)
  {
-@@ -699,6 +736,7 @@ cpu_init(void)
+@@ -699,6 +853,7 @@ cpu_init(void)
  		}
  
  		do_cacheid();
@@ -2373,6 +2595,16 @@ index 94e91306b143..b0e3f2f9eaa2 100644
  
  		/* ARM_SMP: Assuming identical cpu */
  		do_debugid();
+@@ -727,6 +882,9 @@ cpu_init(void)
+ #if MONOTONIC
+ 	cdp->cpu_stat.pmi_cnt_wake = 0;
+ #endif /* MONOTONIC */
++	if (redwood_jit_flush_on) {
++		redwood_uci_off(NULL);    /* a core (re)starting after the trap was armed */
++	}
+ 	cdp->cpu_running = TRUE;
+ 	cdp->cpu_sleep_token_last = cdp->cpu_sleep_token;
+ 	cdp->cpu_sleep_token = 0x0UL;
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
 index e76e7e70ab9c..22e7052a724c 100644
 --- a/osfmk/arm64/machine_routines.c
@@ -2625,6 +2857,185 @@ index e76e7e70ab9c..22e7052a724c 100644
  }
  
  void
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 2cc442e05791..50a9cd78ac33 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1696,6 +1696,163 @@ handle_mach_continuous_time_trap(arm_saved_state_t *state)
+ 
+ 
+ __attribute__((noreturn))
++/*
++ * (redwood) A user cache maintenance instruction, trapped because SCTLR_EL1.UCI is clear (proc_reg.h):
++ * done here on the same line, through the kernel's alias of its physical page (the data caches are PIPT and
++ * the instruction caches non-aliasing at 16 KB pages: CTR_EL0 L1Ip, way sizes <= 16 KB on all three cores),
++ * with the data clean that IC IVAU needs first. A line that is not mapped is let be, as nothing would be
++ * there to execute. True if it was one of these (the thread goes on at the next instruction).
++ */
++uint64_t redwood_user_cache_ops, redwood_user_cache_flushes;
++
++/*
++ * Every core, on itself: the lines of the range (a small one: most of the JIT's flushes are a patched branch
++ * or two, and emptying every core's whole instruction cache for each -- up to 1677 a second -- costs every
++ * program its cache, run 25), or its whole instruction cache (IC IALLU) for a large one. Nothing relies on
++ * IC IVAU's broadcast reaching the other cluster.
++ */
++#define REDWOOD_ICACHE_LOCAL_LINES      256
++struct redwood_icache_range { uint64_t kva[REDWOOD_ICACHE_LOCAL_LINES / 64 + 2]; uint64_t line, end; unsigned pages; };
++
++uint64_t redwood_icache_local_at[8];    /* each core's last invalidation for a range (mach time) */
++uint64_t redwood_icache_range_at;       /* the last range's, any core */
++uint64_t redwood_user_cache_small;      /* of the ranges: done line by line through the kernel's alias */
++
++static void
++redwood_icache_all_local(void *arg)
++{
++	const struct redwood_icache_range *r = arg;
++
++	if (cpu_number() < 8) {
++		redwood_icache_local_at[cpu_number()] = mach_absolute_time();
++	}
++	if (r == NULL) {
++		__asm__ volatile ("ic iallu; dsb nsh; isb" : : : "memory");
++		return;
++	}
++	/* by the kernel's alias of each page (the instruction caches are non-aliasing at 16 KB pages) */
++	for (uint64_t at = r->line; at < r->end; at += 64) {
++		uint64_t page = (at - (r->line & ~(uint64_t)PAGE_MASK)) / PAGE_SIZE;
++
++		if (page < r->pages && r->kva[page] != 0) {
++			__asm__ volatile ("ic ivau, %0" : : "r"(r->kva[page] + (at & PAGE_MASK)) : "memory");
++		}
++	}
++	__asm__ volatile ("dsb nsh; isb" : : : "memory");
++}
++
++/*
++ * The unslid address of the IC IVAU in libsystem_platform's sys_icache_invalidate (iOS 16.5, 20F66), and its
++ * encoding: `ic ivau, x9`, x9 the line, x10 minus the lines left including this one (tools/dsc.py 0x1d0c3dc64).
++ */
++#define REDWOOD_ICACHE_INVALIDATE_IC    0x1d0c3dc8cULL
++#define REDWOOD_IC_IVAU_X9              0xd50b7529u
++
++/*
++ * (redwood) sys_icache_invalidate's whole range at its first trapped line: every line cleaned (DC CVAU through
++ * the kernel's alias of its page), then every core invalidates its own instruction cache, and the loop is
++ * taken to its last iteration. With the M5 cluster online, a line invalidated by IC IVAU on one cluster still
++ * ran stale on the other: WebContent faulted on A55, A76 and M5 alike with the per-line trap (run 24), and
++ * not with the A55 and A76 alone. True if done.
++ */
++static bool
++redwood_icache_range(arm_saved_state_t *state)
++{
++	extern bool redwood_shared_cache_unslide(task_t, uint64_t, uint64_t *);
++	uint64_t pc = get_saved_state_pc(state), cache_pc, line, end;
++	int64_t left = (int64_t)get_saved_state_reg(state, 10);
++	uint32_t insn;
++	pmap_t pmap = current_map()->pmap;
++
++	if (!redwood_shared_cache_unslide(current_task(), pc, &cache_pc) || cache_pc != REDWOOD_ICACHE_INVALIDATE_IC ||
++	    copyin((user_addr_t)pc, &insn, sizeof(insn)) != 0 || insn != REDWOOD_IC_IVAU_X9 ||
++	    left >= 0 || left < -(1LL << 20)) {
++		return false;
++	}
++	line = get_saved_state_reg(state, 9) & ~63ULL;
++	end = line + 64ULL * (uint64_t)(-left);
++	struct redwood_icache_range r = { .line = line, .end = end };
++	bool small = -left <= REDWOOD_ICACHE_LOCAL_LINES;
++
++	for (uint64_t page = line & ~(uint64_t)PAGE_MASK; page < end; page += PAGE_SIZE) {
++		pmap_paddr_t pa = pmap_find_pa_nofault(pmap, page);
++		uint64_t from = MAX(page, line), to = MIN(page + PAGE_SIZE, end);
++
++		if (pa == 0 || !pmap_valid_address(pa)) {
++			continue;
++		}
++		pa &= ~(pmap_paddr_t)PAGE_MASK;
++		uint64_t index = (page - (line & ~(uint64_t)PAGE_MASK)) / PAGE_SIZE;
++
++		if (small && index < sizeof(r.kva) / sizeof(r.kva[0])) {
++			r.kva[index] = phystokv(pa);
++		}
++		for (uint64_t at = from; at < to; at += 64) {
++			__asm__ volatile ("dc cvau, %0" : : "r"(phystokv(pa) + (at - page)) : "memory");
++		}
++	}
++	r.pages = (unsigned)((end - 1 - (line & ~(uint64_t)PAGE_MASK)) / PAGE_SIZE + 1);
++	__asm__ volatile ("dsb ish" : : : "memory");
++	redwood_icache_range_at = mach_absolute_time();
++	if (small && r.pages <= sizeof(r.kva) / sizeof(r.kva[0])) {
++		os_atomic_inc(&redwood_user_cache_small, relaxed);
++	}
++	cpu_broadcast_xcall_simple(TRUE, redwood_icache_all_local,
++	    small && r.pages <= sizeof(r.kva) / sizeof(r.kva[0]) ? &r : NULL);
++	/* the loop's last iteration from here: x9 the last line, x10 -1 (it adds 1 and falls out) */
++	set_saved_state_reg(state, 9, end - 64);
++	set_saved_state_reg(state, 10, (uint64_t)-1LL);
++	os_atomic_inc(&redwood_user_cache_flushes, relaxed);
++	return true;
++}
++
++static bool
++redwood_user_cache_op(arm_saved_state_t *state, uint32_t esr)
++{
++	uint32_t iss = esr & ESR_ISS_MASK;
++	unsigned op0 = (iss >> 20) & 3, op2 = (iss >> 17) & 7, op1 = (iss >> 14) & 7, crn = (iss >> 10) & 0xf;
++	unsigned rt = (iss >> 5) & 0x1f, crm = (iss >> 1) & 0xf, read = iss & 1;
++	uint64_t va, kva;
++	pmap_paddr_t pa;
++
++	/* SYS #3, C7, Cm, #1: IC IVAU (C5), DC CVAC (C10), DC CVAU (C11), DC CVAP (C12), DC CVADP (C13), DC CIVAC (C14) */
++	if (read || op0 != 1 || op1 != 3 || crn != 7 || op2 != 1 ||
++	    !(crm == 5 || crm == 10 || crm == 11 || crm == 12 || crm == 13 || crm == 14)) {
++		return false;
++	}
++	va = rt == 31 ? 0 : get_saved_state_reg(state, rt);
++	pa = pmap_find_pa_nofault(current_map()->pmap, va & ~63ULL);
++	if (os_atomic_load(&redwood_user_cache_ops, relaxed) < 20) {
++		extern void m2m_klog_self(char sev, const char *cat, const char *fmt, ...);
++
++		m2m_klog_self('I', "DEV", "jit_flush: trapped %s va 0x%llx pa 0x%llx (%s) on cpu %d",
++		    crm == 5 ? "ic ivau" : crm == 11 ? "dc cvau" : crm == 14 ? "dc civac" : "dc cvac/cvap", va,
++		    (unsigned long long)pa, pa != 0 && pmap_valid_address(pa) ? "managed" : "not managed: let be",
++		    cpu_number());
++	}
++	if (crm == 5 && redwood_icache_range(state)) {
++		os_atomic_inc(&redwood_user_cache_ops, relaxed);
++		add_saved_state_pc(state, 4);
++		return true;
++	}
++	if (pa != 0 && pmap_valid_address(pa)) {
++		kva = phystokv(pa);
++		if (crm == 5) {
++			/* the clean IC IVAU needs (and iOS does not issue), then the invalidate */
++			__asm__ volatile ("dc cvau, %0; dsb ish; ic ivau, %0; dsb ish" : : "r"(kva) : "memory");
++		} else if (crm == 14) {
++			__asm__ volatile ("dc civac, %0; dsb ish" : : "r"(kva) : "memory");
++		} else if (crm == 11) {
++			__asm__ volatile ("dc cvau, %0; dsb ish" : : "r"(kva) : "memory");
++		} else {
++			__asm__ volatile ("dc cvac, %0; dsb ish" : : "r"(kva) : "memory");
++		}
++	}
++	os_atomic_inc(&redwood_user_cache_ops, relaxed);
++	add_saved_state_pc(state, 4);
++	return true;
++}
++
+ static void
+ handle_msr_trap(arm_saved_state_t *state, uint32_t esr)
+ {
+@@ -1712,6 +1869,10 @@ handle_msr_trap(arm_saved_state_t *state, uint32_t esr)
+ 		panic("MSR/MRS trap (ESR 0x%x) from kernel", esr);
+ 	}
+ 
++	if (redwood_user_cache_op(state, esr)) {
++		return;
++	}
++
+ 	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
+ 	codes[1] = instr;
+ 
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index e5336e5a1cce..3a9ab0d4cb2d 100644
 --- a/osfmk/arm64/start.s
@@ -3314,6 +3725,60 @@ index bec97fbf7243..203e1f48783f 100644
  #endif
  
  #if CONFIG_DTRACE
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 24ed3268f2a3..50e7ca1d388b 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -3880,6 +3880,9 @@ task_resume(
+  * Suspend the target task.
+  * Making/holding a token/reference/port is the callers responsibility.
+  */
++/* mali2metal's channel: a Metal client held or let go (bsd/dev/redwood_m2m.c) */
++extern void redwood_m2m_task_hold(void *bsd_info, int held, const char *how);
++
+ kern_return_t
+ task_suspend_internal(task_t task)
+ {
+@@ -3892,6 +3895,9 @@ task_suspend_internal(task_t task)
+ 	task_lock(task);
+ 	kr = place_task_hold(task, TASK_HOLD_NORMAL);
+ 	task_unlock(task);
++	if (kr == KERN_SUCCESS) {
++		redwood_m2m_task_hold(get_bsdtask_info(task), 1, "task_suspend");
++	}
+ 	return kr;
+ }
+ 
+@@ -3957,6 +3963,9 @@ task_resume_internal(
+ 	task_lock(task);
+ 	kr = release_task_hold(task, TASK_HOLD_NORMAL);
+ 	task_unlock(task);
++	if (kr == KERN_SUCCESS) {
++		redwood_m2m_task_hold(get_bsdtask_info(task), 0, "task_resume");
++	}
+ 	return kr;
+ }
+ 
+@@ -4084,6 +4093,9 @@ task_pidsuspend(
+ 
+ 	task_unlock(task);
+ 
++	if (KERN_SUCCESS == kr) {
++		redwood_m2m_task_hold(get_bsdtask_info(task), 1, "pid_suspend");
++	}
+ 	if ((KERN_SUCCESS == kr) && task->message_app_suspended) {
+ 		iokit_task_app_suspended_changed(task);
+ 	}
+@@ -4126,6 +4138,9 @@ task_pidresume(
+ 
+ 	task_unlock(task);
+ 
++	if (KERN_SUCCESS == kr) {
++		redwood_m2m_task_hold(get_bsdtask_info(task), 0, "pid_resume");
++	}
+ 	if ((KERN_SUCCESS == kr) && task->message_app_suspended) {
+ 		iokit_task_app_suspended_changed(task);
+ 	}
 diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
 index 384ef23fe0e1..d5ab6db0edbc 100644
 --- a/osfmk/kern/thread.c
@@ -3345,6 +3810,24 @@ index 384ef23fe0e1..d5ab6db0edbc 100644
  uint64_t
  thread_last_run_time(thread_t th)
  {
+diff --git a/osfmk/kern/timer_call.c b/osfmk/kern/timer_call.c
+index f8c81800d173..ece345be4977 100644
+--- a/osfmk/kern/timer_call.c
++++ b/osfmk/kern/timer_call.c
+@@ -1014,6 +1014,13 @@ timer_queue_expire_with_options(
+ 			 */
+ 			uint64_t *ttdp = &current_processor()->timer_call_ttd;
+ 			*ttdp = call->tc_ttd;
++#if defined(GENERIC_PSCI_SMP)
++			{
++				extern void redwood_wake_timer(void *func, void *param0);
++
++				redwood_wake_timer((void *)func, param0);      /* what wakes the cores (psci_smp.c) */
++			}
++#endif
+ 			(*func)(param0, param1);
+ 			*ttdp = 0;
+ #if CONFIG_DTRACE
 diff --git a/osfmk/kern/work_interval.c b/osfmk/kern/work_interval.c
 index f2b9ce24bd8d..3aed167fe32e 100644
 --- a/osfmk/kern/work_interval.c
@@ -3381,6 +3864,38 @@ index 8b46efb05c86..e161ca426b1a 100644
  extern kern_return_t
  kern_work_interval_set_workload_id(mach_port_name_t port_name,
      struct kern_work_interval_workload_id_args *workload_id_args);
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+index db1d61332643..c88e6c21a919 100644
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -230,6 +230,27 @@ extern u_int32_t random(void);
+  * The caller is responsible for consuming that extra reference if
+  * necessary.
+  */
++/*
++ * (redwood) `addr` as the shared cache was built (unslid), if it lies in the task's shared region: what a
++ * fault record prints so tools/dsc.py can read the code there.
++ */
++bool redwood_shared_cache_unslide(task_t task, uint64_t addr, uint64_t *unslid);
++bool
++redwood_shared_cache_unslide(task_t task, uint64_t addr, uint64_t *unslid)
++{
++	vm_shared_region_t sr = vm_shared_region_get(task);
++	bool in = false;
++
++	if (sr != NULL) {
++		if (addr >= sr->sr_base_address && addr < sr->sr_base_address + sr->sr_size) {
++			*unslid = addr - sr->sr_slide;
++			in = true;
++		}
++		vm_shared_region_deallocate(sr);
++	}
++	return in;
++}
++
+ vm_shared_region_t
+ vm_shared_region_get(
+ 	task_t          task)
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 index 3ad743fc3efb..8bdff036048d 100644
 --- a/pexpert/arm/pe_fiq.c

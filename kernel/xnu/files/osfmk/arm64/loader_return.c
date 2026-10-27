@@ -58,6 +58,7 @@ extern void redwood_haptic_quiesce(void);
 extern void redwood_torch_quiesce(void);
 extern void redwood_camera_quiesce(void);
 extern void redwood_exynos_sound_quiesce(void);
+extern void redwood_m2m_to_loader(void);
 extern void redwood_mic_quiesce(void);
 extern void redwood_ufs_quiesce(void);
 extern void redwood_var_save_on_return(void);   /* bsd/dev/redwood_ufs.c: the data volume into the flash */
@@ -67,6 +68,9 @@ void loader_checkpoint(uint64_t n);
 char     loader_log[LOADER_LOG_SIZE];
 uint32_t loader_log_len;
 static bool     loader_return_entered;
+/* why this run is handing back: the loader reads it (CTX_REASON) and acts on 3 by opening Log
+ * access instead of booting again. Set from user space by kern.redwood_menu. */
+static uint64_t loader_return_reason;
 
 /* One L1 table and one L2 table are enough to map a single 2 MB block. */
 static uint64_t loader_l1[512] __attribute__((aligned(4096)));
@@ -420,6 +424,7 @@ loader_return(void)
 	loader_log_linearize();
 	if (!loader_return_entered) {
 		loader_log_append_msgbuf();
+		redwood_m2m_to_loader();        /* mali2metal's last records, for a run that ends without a network */
 	}
 	if (!loader_return_entered && debug_buf_base != NULL && debug_buf_ptr > debug_buf_base &&
 	    (size_t)(debug_buf_ptr - debug_buf_base) < 256 * 1024) {
@@ -428,7 +433,19 @@ loader_return(void)
 			loader_log_putc(*c);
 		}
 	}
-	loader_jump(0, 0);
+	loader_jump(loader_return_reason, 0);
+}
+
+/*
+ * Hand back to the loader *and tell it why*: `reason' is the loader's own CTX_REASON code, passed
+ * as it is (kern.redwood_menu maps its values to these: 0 an ordinary return, 3 Log access,
+ * 4 Download Mode).
+ */
+void
+loader_return_asked(uint64_t reason)
+{
+	loader_return_reason = reason;
+	loader_return();
 }
 
 /* Bring-up aid: stop here if the loader asked for checkpoint n. */

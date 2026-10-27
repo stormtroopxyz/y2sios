@@ -37,6 +37,7 @@
  * self-test without iOS).
  */
 #include <kern/clock.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <libkern/OSAtomic.h>
@@ -78,6 +79,13 @@ extern int redwood_wifi_dma_pool(uint64_t *phys, vm_offset_t *virt, size_t *size
 #define DIV_SCLK                0x1828U
 #define DIV_UAIF2               0x1834U
 #define CLK_BUSY                (1U << 16)
+/* gates (cmucal-sfr.c, exynos9830): MANUAL 20 -> CG_VAL 21 decides; else ENABLE_AUTOMATIC_CLKGATING 28 (1: gated when idle) */
+#define GATE_CG_VAL             (1U << 21)
+#define GATE_MANUAL             (1U << 20)
+#define GATE_AUTO               (1U << 28)
+/* Q-channels: ENABLE 0 (1: the IP's handshake may stop the clock); with it 0, CLOCK_REQ 1 keeps the clock asked for */
+#define QCH_ENABLE              (1U << 0)
+#define QCH_CLOCK_REQ           (1U << 1)
 
 #define SYSMMU_PHYS             0x18e50000U
 #define MMU_CTRL                0x0000U
@@ -91,6 +99,10 @@ extern int redwood_wifi_dma_pool(uint64_t *phys, vm_offset_t *virt, size_t *size
 #define ABOX_VERSION            0x0004U
 #define ABOX_SYSPOWER_CTRL      0x0010U
 #define ABOX_SYSPOWER_STATUS    0x0014U
+#define ABOX_DYN_CLOCK_OFF      0x0030U
+#define ABOX_QCHANNEL_DISABLE   0x0038U         /* one bit per clock (abox.h enum qchannel): 1 ACLK, 2 + n BCLK_UAIFn */
+#define QCH_ABOX_ACLK           1
+#define QCH_ABOX_BCLK_UAIF(n)   (2 + (n))
 #define ABOX_ROUTE_CTRL0        0x0040U         /* UAIFx's speaker source, 4 bits each: SIFSn + 1 */
 #define ABOX_SPUS_CTRL_FC0      0x0200U         /* chains 0..3, 8 bits each: IN 6:5 (0 RDMA), OUT 4:1 (1 SIFS0), ASRC 0 */
 #define ABOX_SPUS_CTRL1         0x0204U         /* MIXP_FORMAT 4:0 */
@@ -205,6 +217,15 @@ static struct redwood_bbi2c amp_bus = { .name = "amp bus gpp4-2/3", .scl = 2, .s
 static int16_t ring[RING_FRAMES * 2];
 static volatile uint32_t ring_head, ring_tail;
 static volatile uint64_t last_sound_us;
+/*
+ * Quiet: the amplifiers off, no tone, no sound from iOS for QUIET_OFF_US (it keeps sending silence): the DMA's
+ * whole ring is silence (it goes on reading it round and round) and the thread sleeps until iOS sends sound
+ * (exynos_sink), a second at most, the silence meanwhile dropped -- instead
+ * of feeding silence every 4 ms (some 1000 wake-ups a second on the big cores: the cpuidle wake record,
+ * 27 October).
+ */
+static volatile bool snd_quiet;
+static uint64_t quiet_spells, quiet_us;
 static uint64_t ios_frames, fed_frames, silent_frames, underruns;
 
 static const int16_t tone[48] = {
@@ -238,6 +259,53 @@ wr(volatile uint8_t *base, uint32_t off, uint32_t value)
 {
 	*(volatile uint32_t *)(base + off) = value;
 	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/*
+ * The speaker path's clocks through CMU_AUD's gates and Q-channels, opened as Samsung's cal-if does it
+ * (ra.c: ra_set_gate pass, ra_req_enable_qch). Without the DSP's driver nothing asks for them, and an
+ * automatically gated BCLK_UAIF2 is a UAIF that never pulls a sample: RDMA3 stayed "in progress" with 0
+ * frames read and UAIF2's status 0 (PLANS/08-audio.md). Each register is said before and after.
+ */
+static void
+snd_clocks_on(void)
+{
+	static const struct { uint32_t off; const char *name; } gates[] = {
+		{ 0x2010, "ABOX ACLK" }, { 0x2018, "ABOX BCLK_CNT" }, { 0x2028, "ABOX BCLK_UAIF2" },
+		{ 0x2048, "ABOX SCLK" }, { 0x2058, "LHM_AXI_P" }, { 0x205c, "LHS_AXI_D" },
+		{ 0x2070, "RSTNSYNC BUSP" }, { 0x2074, "RSTNSYNC BUS" }, { 0x2078, "RSTNSYNC CNT" },
+		{ 0x2094, "RSTNSYNC SCLK" }, { 0x20a0, "RSTNSYNC UAIF2" },
+	};
+	static const struct { uint32_t off; const char *name; } qchs[] = {
+		{ 0x301c, "QCH ACLK" }, { 0x3028, "QCH BCLK2" }, { 0x3044, "QCH CNT" }, { 0x3048, "QCH SCLK" },
+	};
+	char line[600];
+	size_t at = 0;
+
+	at += snprintf(line + at, sizeof(line) - at, "snd: CMU_AUD gates before -> after:");
+	for (unsigned i = 0; i < sizeof(gates) / sizeof(gates[0]); i++) {
+		uint32_t was = rd(cmu, gates[i].off), now = was;
+
+		if (was & GATE_MANUAL) {
+			now |= GATE_CG_VAL;
+		} else {
+			now &= ~GATE_AUTO;
+		}
+		if (now != was) {
+			wr(cmu, gates[i].off, now);
+		}
+		at += snprintf(line + at, sizeof(line) - at, " %s %#x->%#x;", gates[i].name, was, rd(cmu, gates[i].off));
+	}
+	snd_log("%s\n", line);
+	at = 0;
+	at += snprintf(line + at, sizeof(line) - at, "snd: CMU_AUD Q-channels before -> after:");
+	for (unsigned i = 0; i < sizeof(qchs) / sizeof(qchs[0]); i++) {
+		uint32_t was = rd(cmu, qchs[i].off);
+
+		wr(cmu, qchs[i].off, (was & ~QCH_ENABLE) | QCH_CLOCK_REQ);
+		at += snprintf(line + at, sizeof(line) - at, " %s %#x->%#x;", qchs[i].name, was, rd(cmu, qchs[i].off));
+	}
+	snd_log("%s\n", line);
 }
 
 static inline void
@@ -650,6 +718,7 @@ aud_clocks(void)
 	set_div(DIV_BUSP, 0x3, 2);              /* 65.5 MHz */
 	set_div(DIV_AUDIF, 0x1ff, 15);          /* 73.728 MHz */
 	set_div(DIV_SCLK, 0x1ff, 0);            /* ABOX's SCLK: 73.728 MHz */
+	snd_clocks_on();
 	upd(cmu, MUX_UAIF2, 0x3, 0);            /* UAIF2 from AUDIF */
 	wait_bits(cmu, MUX_UAIF2, CLK_BUSY, 0, 1000);
 	set_div(DIV_UAIF2, 0x1ff, 23);          /* 3.072 MHz */
@@ -687,6 +756,20 @@ abox_route(void)
 	}
 	wr(abox, ABOX_SIFS_CNT0, 0);
 	upd(abox, ABOX_ROUTE_CTRL0, 0xfU << (4 * UAIF_ID), 1U << (4 * UAIF_ID));
+
+	/*
+	 * UAIF2's bit clock past the ABOX's own Q-channel: Samsung's driver disables it when the interface's BCLK
+	 * widget powers up (abox_if.c, abox_if_bclk_event -> abox_disable_qchannel(ABOX_BCLK_UAIF0 + id, 1)), and
+	 * with nothing asking for the clock the UAIF never pulls a sample -- RDMA3 "in progress", 0 frames read,
+	 * with CMU_AUD's gates and Q-channels all open (run 30). The bus clock (ACLK) as well.
+	 */
+	{
+		uint32_t qch = rd(abox, ABOX_QCHANNEL_DISABLE), dyn = rd(abox, ABOX_DYN_CLOCK_OFF);
+
+		wr(abox, ABOX_QCHANNEL_DISABLE, qch | (1U << QCH_ABOX_BCLK_UAIF(UAIF_ID)) | (1U << QCH_ABOX_ACLK));
+		snd_log("snd: ABOX Q-channels disabled %#x -> %#x (BCLK_UAIF%u, ACLK); dynamic clock off %#x\n", qch,
+		    rd(abox, ABOX_QCHANNEL_DISABLE), UAIF_ID, dyn);
+	}
 
 	/* UAIF2: set_fmt DSP_A | NB_NF | CBS_CFS, hw_params 32 bits x 2 */
 	ctrl0 = rd(abox, ABOX_UAIF_CTRL0);
@@ -784,6 +867,9 @@ exynos_sink(const int16_t *frames, uint32_t count)
 	ios_frames += taken;
 	if (sound) {
 		last_sound_us = now_us();
+	}
+	if (sound && snd_quiet) {
+		thread_wakeup((event_t)&ring_head);     /* the thread is waiting for something to play */
 	}
 	return taken;
 }
@@ -913,11 +999,13 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 					snd_log("snd: amplifiers off (%llu frames from iOS, %llu fed, %u underruns)\n", ios_frames, fed_frames,
 					    (uint32_t)underruns);
 				}
+			} else if (sound) {
+				quiet_since = 0;
 			}
+			/* (quiet_since is not touched here: clearing it on every pass kept the amplifiers on for good, 27 October) */
 			if (amps_on) {
 				uint32_t total = snd_below + (tone_left != 0 ? 0 : below);
 
-				quiet_since = 0;
 				amps_volume(total, false);
 				redwood_guard_attenuation(total);
 				if (now - checked_at >= 500000) {
@@ -936,8 +1024,39 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 		if (now - last_look >= 60000000) {
 			last_look = now;
-			snd_log("snd: %llu frames from iOS, %llu fed, %llu silent, %u underruns; DMA at %u (%s)\n", ios_frames, fed_frames,
-			    silent_frames, (uint32_t)underruns, pos, use_status ? "followed" : "by the clock");
+			snd_log("snd: %llu frames from iOS, %llu fed, %llu silent, %u underruns; DMA at %u (%s); quiet %llu times, "
+			    "%llu ms in all\n", ios_frames, fed_frames, silent_frames, (uint32_t)underruns, pos,
+			    use_status ? "followed" : "by the clock", quiet_spells, quiet_us / 1000);
+		}
+		if (decided && !amps_on && tone_left == 0 &&
+		    (last_sound_us == 0 || now - last_sound_us >= QUIET_OFF_US)) {
+			uint64_t began = now_us(), heard = last_sound_us;
+
+			/* the whole ring silence, then asleep until iOS sends sound (it goes on sending silence: dropped) */
+			bzero(buf, BUF_BYTES);
+			__asm__ volatile ("dsb sy" ::: "memory");
+			snd_quiet = true;
+			quiet_spells++;
+			while (last_sound_us == heard && now_us() - began < 60000000) {
+				ring_tail = ring_head;
+				assert_wait_timeout((event_t)&ring_head, THREAD_UNINT, 1000, NSEC_PER_MSEC);
+				if (last_sound_us != heard) {
+					clear_wait(current_thread(), THREAD_AWAKENED);
+					break;
+				}
+				thread_block(THREAD_CONTINUE_NULL);
+			}
+			snd_quiet = false;
+			now = now_us();
+			quiet_us += now - began;
+			/* on from where the DMA is now: the count again such that count % BUF_FRAMES is its ring index */
+			pos = dma_position(NULL);
+			base = written + (pos + BUF_FRAMES - (uint32_t)(written % BUF_FRAMES)) % BUF_FRAMES;
+			written = base;
+			last_pos = pos;
+			status_consumed = 0;
+			t0 = now;
+			continue;
 		}
 		IOSleep(4);
 	}

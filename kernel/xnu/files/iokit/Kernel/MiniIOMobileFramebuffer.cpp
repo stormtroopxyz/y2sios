@@ -101,10 +101,16 @@ static TUNABLE(uint32_t, gDPU, "fb_dpu", 0);
  */
 static TUNABLE(uint32_t, gScaler, "fb_scaler", 0);
 /*
- * fb_swapwait=0: a swap returns as soon as it is queued even when the controller reads the surface itself.
- * By default, with the scaler on, the swap returns once its frame is on the panel: CoreAnimation draws its
- * next frame into the surface the panel shows until then (double buffering), and with zero copy that is
- * the panel's own memory (run 17: icons, dock, Settings tearing).
+ * fb_swapwait=1: with the scaler on, SwapEnd returns only once its frame is on the panel (run 17's cure for
+ * tearing: CoreAnimation draws its next frame into the surface the panel showed).
+ * By default SwapEnd returns once the swap is queued and the wait is where CoreAnimation asks for it: before
+ * each swap it calls IOMobileFramebufferSwapWait for the swaps before (`tl: w N-2`, `w N-1`, then `s N`:
+ * run 27), and only then draws into the surface that swap N-2 had. kFBMethodSwapWait answers once the swap
+ * asked about is on the panel (fShownSwapID), so the drawing of a frame overlaps the panel's wait for the one
+ * before, as with Apple's driver. present() counts a swap whose surface is still shown or queued (would tear).
+ * Measured (runs 27-28, PLANS/10-mali2metal.md): no gain -- 45 % of animation frames at 60 Hz against 48 %
+ * with the swap waiting -- because what spaces the frames is the window server's own time, so the swap
+ * waits again by default (fb_swapwait=1) and fb_swapwait=0 keeps the protocol for when that changes.
  */
 static TUNABLE(uint32_t, gSwapWait, "fb_swapwait", 1);
 #define SCALER_CH               5
@@ -156,6 +162,27 @@ static const int16_t scalerBicubic[9][4] = {
  * buffer it reads, and the trigger is let go: the next TE sends the whole new frame.
  */
 static TUNABLE(uint32_t, gTE, "fb_te", 0);
+
+/*
+ * Boot-arg fb_irq (default 1): the waits for DECON to take a new frame (its shadow registers latch at the
+ * start of a frame) sleep until its frame-start interrupt (Samsung's dt: decon_f interrupts, the first: SPI
+ * 0xfe, level; decon_irq_handler clears INTERRUPT_PENDING bit 12) instead of looking every 100 us -- each
+ * look a timer, some 2800 a second on the big cores (the cpuidle wake record, 27 October). Unmasked only
+ * while somebody waits: the panel's frames start on every TE whether anything changed or not.
+ * fb_irq=0: the polling, as before.
+ */
+static TUNABLE(uint32_t, gFrameIrq, "fb_irq", 1);
+#define DECON_INTID_FRAME_START (32 + 0xfe)
+#define DECON_INT_EN_ALL        (1u << 0)               /* INTERRUPT_ENABLE: DPU_INT_EN */
+#define DECON_INT_FRAME_DONE    (1u << 13)
+#define DECON_INT_EXTRA         (1u << 4)
+/* a wait sleeps at most this long between looks: a 60 Hz refresh (27 October: no frame-start interrupt was
+ * missed, 0 waits gave up; at 4 ms, 35 of 59 waits looked again for nothing) */
+#define LATCH_CAP_MS            17
+extern "C" kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid),
+    void *context);
+extern "C" void gic_v3_spi_mask(uint32_t intid);
+extern "C" void gic_v3_spi_unmask(uint32_t intid);
 #define DECON_GLOBAL_IDLE       (1u << 5)               /* no frame being sent */
 #define DECON_GLOBAL_RUN        (1u << 4)
 #define DECON_GLOBAL_CMD_MODE   (1u << 8)
@@ -491,6 +518,16 @@ public:
 	uint64_t        fLatchTime;                     /* when the scaler's last frame was seen taken: the panel's phase */
 	bool            fSwapQueuedUse[SWAP_QUEUE];     /* the slot's surface was counted in use when queued */
 	uint32_t        fStatSwapWaitTimeouts;
+	uint32_t        fShownSwapID, fQueuedSwapID;    /* the last swap on the panel, and the last queued (SwapWait) */
+	uint32_t        fShownSid, fNextSid;            /* the surfaces the panel reads and has been asked for (ids) */
+	uint32_t        fStatIntoShown;                 /* swaps whose surface was still shown or queued: would tear */
+	/* what the swaps were (fb_swap line): which bottom-layer surfaces, how many asked for what the one before did */
+	uint8_t         fPrevSwapLayers[SWAP_LAYERS_CLEARED + 4 - SWAP_SURFACE(0)];
+	uint32_t        fStatSwapSame;                  /* swaps with the same surfaces, rectangles and layers as the one before */
+	uint32_t        fStatSwapSids[8], fStatSwapSidsMore;    /* the bottom layer's different surfaces; beyond 8 */
+	int             fStatSwapPid;                   /* who swapped last */
+	uint32_t        fStatSwapWaits, fStatSwapWaitsBlocked, fStatSwapWaitTimeouts2;
+	uint64_t        fStatSwapWaitTime;
 	/*
 	 * ... and not whenever the GPU happens to be done, but on a beat of the refresh rate
 	 * (boot-arg fb_beat=0: at once): frames then follow each other at an even pace whatever
@@ -598,6 +635,7 @@ public:
 	void publishModes(void);
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
+	void swapWait(uint32_t id);
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
@@ -620,6 +658,14 @@ public:
 	void flipNow(void);
 	void runJob(struct RowJob * job);
 	void teSetup(void);
+	bool            fFrameIrq;              /* fb_irq: the frame-start interrupt is attached */
+	volatile uint32_t fFrameStarts;         /* frame starts it has seen */
+	uint32_t        fStatLatchIrq, fStatLatchCap, fStatLatchLimit;
+	void frameIrqSetup(void);
+	static void frameIrq(void * context, uint32_t intid);
+	bool latchWait(uint32_t mask, uint64_t start);
+	uint32_t frameStartMark(void);
+	bool frameStartSince(uint32_t mark);
 	void teMeasure(void);
 	void tePresent(int32_t y0, int32_t y1);
 	void teReport(uint64_t nanos);
@@ -644,6 +690,9 @@ public:
 
 OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
 static IOMobileFramebuffer * gFramebuffer;      /* the one there is (redwood_fb_quiesce) */
+static volatile uint32_t gBLThermalCap;
+/* the window server's refresh notifications (kFBNotifyVSync): asked for, sent, not sent (no port, or closed) */
+static volatile UInt32 gVSyncAsked, gVSyncSent, gVSyncStopped;         /* nits in 16.16 the panel is held under while the chip is hot; 0: none */
 
 static void
 setNumber(OSDictionary * dict, const char * key, uint64_t value)
@@ -783,6 +832,9 @@ IOMobileFramebuffer::start(IOService * provider)
 	}
 	if (gTE && !gFlip) {
 		teSetup();
+	}
+	if (gFrameIrq) {
+		frameIrqSetup();        /* (after teSetup: its measuring reads the frame-start flag itself) */
 	}
 	blSetup();
 
@@ -1209,13 +1261,8 @@ IOMobileFramebuffer::flipWait(void)
 	if (!fFlipPending) {
 		return;
 	}
-	nanoseconds_to_absolutetime((uint64_t) FLIP_LATCH_MS * NSEC_PER_MSEC, &limit);
-	while ((dpuRead(fDecon, DECON_SHADOW_UPDATE) & mask) != 0) {
-		if (mach_absolute_time() - fFlipStart > limit) {
-			break;
-		}
-		delay(100);
-	}
+	(void) limit;
+	latchWait(mask, fFlipStart);
 	waited = mach_absolute_time() - began;
 	fStatFlipWait += waited;
 	fFlipPending = false;
@@ -1426,10 +1473,8 @@ IOMobileFramebuffer::scalerWait(void)
 	if (!fScanPending) {
 		return true;
 	}
-	nanoseconds_to_absolutetime((uint64_t) FLIP_LATCH_MS * NSEC_PER_MSEC, &limit);
-	while ((dpuRead(fDecon, DECON_SHADOW_UPDATE) & mask) != 0 && mach_absolute_time() - fScanStart < limit) {
-		delay(100);
-	}
+	(void) limit;
+	latchWait(mask, fScanStart);
 	fStatScanWait += mach_absolute_time() - began;
 	fScanPending = false;
 	taken = (dpuRead(fDecon, DECON_SHADOW_UPDATE) & mask) == 0;
@@ -1470,6 +1515,8 @@ IOMobileFramebuffer::scalerWait(void)
 	}
 	fScanShown = fScanNext;
 	fScanNext = NULL;
+	fShownSid = fScanShown != NULL ? fScanShown->sid : 0;
+	fNextSid = 0;
 	return true;
 }
 
@@ -1502,6 +1549,7 @@ IOMobileFramebuffer::scalerShow(MiniIOSurface * s)
 	/* held, and in use for its maker, until the frame after it is taken */
 	fScanNext = MiniIOSurfaceCopy(s->sid);
 	MiniIOSurfaceDisplayUse(fScanNext, 1);
+	fNextSid = s->sid;
 	fScanAsked = base;
 	fScanStart = mach_absolute_time();
 	fScanPending = true;
@@ -1534,10 +1582,8 @@ IOMobileFramebuffer::scalerOff(const char * why, bool forever)
 	dpuWrite(fDecon, DECON_DATA_PATH_1, (paths1 & ~(7u << (4 * fWin))) | (fScanCh << (4 * fWin)));
 	__asm__ volatile ("dsb sy" ::: "memory");
 	dpuWrite(fDecon, DECON_SHADOW_UPDATE, dpuRead(fDecon, DECON_SHADOW_UPDATE) | mask);
-	nanoseconds_to_absolutetime((uint64_t) FLIP_LATCH_MS * NSEC_PER_MSEC, &limit);
-	while ((dpuRead(fDecon, DECON_SHADOW_UPDATE) & mask) != 0 && mach_absolute_time() - began < limit) {
-		delay(100);
-	}
+	(void) limit;
+	latchWait(mask, began);
 	if (fScanShown != NULL) {
 		MiniIOSurfaceDisplayUse(fScanShown, -1);
 		MiniIOSurfaceDrop(fScanShown);
@@ -1642,6 +1688,109 @@ IOMobileFramebuffer::teMeasure(void)
 	}
 }
 
+/* The frame-start interrupt: fb_irq. */
+void
+IOMobileFramebuffer::frameIrqSetup(void)
+{
+	uint32_t enable;
+
+	if (fDecon == NULL) {
+		fDecon = (volatile uint8_t *) ml_io_map((vm_offset_t) DPU_DECON_F_PHYS, 0x10000);
+	}
+	if (fDecon == NULL) {
+		fbSay("fb_irq: DECON_F not mapped: off\n");
+		return;
+	}
+	enable = dpuRead(fDecon, DECON_INT_ENABLE);
+	/* only frame start: frame done and the extra ones would want clearing of their own (decon_reg_set_int) */
+	dpuWrite(fDecon, DECON_INT_ENABLE, (enable & ~(DECON_INT_FRAME_DONE | DECON_INT_EXTRA)) | DECON_INT_FRAME_START |
+	    DECON_INT_EN_ALL);
+	dpuWrite(fDecon, DECON_INT_PENDING, DECON_INT_FRAME_START | DECON_INT_FRAME_DONE | DECON_INT_EXTRA);
+	if (gic_v3_spi_attach(DECON_INTID_FRAME_START, false, frameIrq, this) != KERN_SUCCESS) {
+		dpuWrite(fDecon, DECON_INT_ENABLE, enable);
+		fbSay("fb_irq: interrupt %u could not be attached: off\n", DECON_INTID_FRAME_START);
+		return;
+	}
+	gic_v3_spi_mask(DECON_INTID_FRAME_START);
+	fFrameIrq = true;
+	fbSay("fb_irq: DECON frame start on interrupt %u (INTERRUPT_ENABLE %#x -> %#x): the waits for a frame to be taken sleep "
+	    "until it\n", DECON_INTID_FRAME_START, enable, dpuRead(fDecon, DECON_INT_ENABLE));
+}
+
+/* (interrupt context) a frame has started: its flag cleared, the waiter woken, quiet until the next wait */
+void
+IOMobileFramebuffer::frameIrq(void * context, uint32_t intid)
+{
+	IOMobileFramebuffer * fb = (IOMobileFramebuffer *) context;
+	uint32_t pending = dpuRead(fb->fDecon, DECON_INT_PENDING);
+
+	dpuWrite(fb->fDecon, DECON_INT_PENDING, pending & (DECON_INT_FRAME_START | DECON_INT_FRAME_DONE | DECON_INT_EXTRA));
+	gic_v3_spi_mask(intid);
+	if (pending & DECON_INT_FRAME_START) {
+		OSIncrementAtomic((volatile SInt32 *) &fb->fFrameStarts);
+	}
+	thread_wakeup((event_t) (uintptr_t) &fb->fFrameStarts);
+}
+
+/*
+ * Until the shadow bits of `mask` are clear (DECON has taken what was asked at `start`) or FLIP_LATCH_MS have
+ * gone by. false: they did not clear.
+ */
+bool
+IOMobileFramebuffer::latchWait(uint32_t mask, uint64_t start)
+{
+	uint64_t limit, cap;
+
+	nanoseconds_to_absolutetime((uint64_t) FLIP_LATCH_MS * NSEC_PER_MSEC, &limit);
+	nanoseconds_to_absolutetime((uint64_t) LATCH_CAP_MS * NSEC_PER_MSEC, &cap);
+	while ((dpuRead(fDecon, DECON_SHADOW_UPDATE) & mask) != 0) {
+		uint64_t now = mach_absolute_time();
+
+		if (now - start >= limit) {
+			fStatLatchLimit++;
+			return false;
+		}
+		if (!fFrameIrq) {
+			delay(100);
+			continue;
+		}
+		uint64_t deadline = now + cap < start + limit ? now + cap : start + limit;
+		uint32_t seen = fFrameStarts;
+
+		dpuWrite(fDecon, DECON_INT_PENDING, DECON_INT_FRAME_START);   /* (no stale one) */
+		assert_wait_deadline((event_t) (uintptr_t) &fFrameStarts, THREAD_UNINT, deadline);
+		gic_v3_spi_unmask(DECON_INTID_FRAME_START);
+		if ((dpuRead(fDecon, DECON_SHADOW_UPDATE) & mask) == 0) {
+			clear_wait(current_thread(), THREAD_AWAKENED);
+			gic_v3_spi_mask(DECON_INTID_FRAME_START);
+			break;
+		}
+		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT) {
+			gic_v3_spi_mask(DECON_INTID_FRAME_START);
+			fStatLatchCap++;
+		} else if (fFrameStarts != seen) {
+			fStatLatchIrq++;
+		}
+	}
+	return true;
+}
+
+/* The frame-start flag for tePresent: a mark now, then whether a frame has started since. */
+uint32_t
+IOMobileFramebuffer::frameStartMark(void)
+{
+	/* (the presenter's thread, as latchWait: the interrupt is masked now, the flag is ours) */
+	dpuWrite(fDecon, DECON_INT_PENDING, DECON_INT_FRAME_START);
+	return fFrameStarts;
+}
+
+bool
+IOMobileFramebuffer::frameStartSince(uint32_t mark)
+{
+	return fFrameStarts != mark ||
+	       (dpuRead(fDecon, DECON_INT_PENDING) & DECON_INT_FRAME_START) != 0;
+}
+
 void
 IOMobileFramebuffer::teSetup(void)
 {
@@ -1712,15 +1861,17 @@ IOMobileFramebuffer::tePresent(int32_t y0, int32_t y1)
 			break;
 		}
 		/* a TE just before the mask may start a frame a moment later: idle, and no frame started since */
-		dpuWrite(fDecon, DECON_INT_PENDING, DECON_INT_FRAME_START);
+		uint32_t mark = frameStartMark();
+
 		delay(TE_SETTLE_US);
-		if ((dpuRead(fDecon, DECON_INT_PENDING) & DECON_INT_FRAME_START) == 0 || attempt == 2) {
+		if (!frameStartSince(mark) || attempt == 2) {
 			break;
 		}
 		fTeLate++;
 	}
 	idleAt = mach_absolute_time();
 	frames = dpuRead(fDecon, DECON_FRAME_COUNT);
+	uint32_t startsAtIdle = fFrameStarts;
 	bzero(&job, sizeof(job));
 	job.copy = true;
 	job.ry0 = y0;
@@ -1728,7 +1879,7 @@ IOMobileFramebuffer::tePresent(int32_t y0, int32_t y1)
 	runJob(&job);
 	__asm__ volatile ("dsb sy" ::: "memory");
 	fTeRaced += dpuRead(fDecon, DECON_FRAME_COUNT) != frames ||
-	    (fTeStartFlag && (dpuRead(fDecon, DECON_INT_PENDING) & DECON_INT_FRAME_START) != 0);
+	    (fTeStartFlag && frameStartSince(startsAtIdle));
 	dpuWrite(fDecon, DECON_TRIG_CONTROL, fTeTrig);
 	waited = idleAt - began;
 	fTeFrames++;
@@ -2013,6 +2164,9 @@ IOMobileFramebuffer::blWork(thread_call_param_t self, thread_call_param_t unused
 		IOLockLock(fb->fBLLock);
 		target = fb->fBLTarget;
 		IOLockUnlock(fb->fBLLock);
+		if (gBLThermalCap != 0 && target > gBLThermalCap) {
+			target = gBLThermalCap;
+		}
 		dbv = nitsToDBV(target);
 		nits = (uint64_t) target < ((uint64_t) kPanelMaxNits << 16) ? target : (uint64_t) kPanelMaxNits << 16;
 		aor = fb->fAor0 < PANEL_AOR_DARKEST ?
@@ -2458,7 +2612,31 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 		}
 	}
 	unsigned slot = (fSwapFirst + fSwapsWaiting) % SWAP_QUEUE;
+	uint32_t sid0 = swapWord(swap, SWAP_SURFACE(0));
 
+	if (gScaler && fScalerReady && sid0 != 0) {
+		bool busy = sid0 == fShownSid || sid0 == fNextSid;
+
+		for (unsigned k = 0; k < fSwapsWaiting; k++) {
+			busy |= swapWord(fSwap[(fSwapFirst + k) % SWAP_QUEUE], SWAP_SURFACE(0)) == sid0;
+		}
+		fStatIntoShown += busy;
+	}
+	fQueuedSwapID = swapWord(swap, SWAP_ID);
+	fStatSwapSame += memcmp(fPrevSwapLayers, swap + SWAP_SURFACE(0), sizeof(fPrevSwapLayers)) == 0;
+	memcpy(fPrevSwapLayers, swap + SWAP_SURFACE(0), sizeof(fPrevSwapLayers));
+	{
+		unsigned i;
+
+		for (i = 0; i < 8 && fStatSwapSids[i] != 0 && fStatSwapSids[i] != sid0; i++) {
+		}
+		if (i == 8) {
+			fStatSwapSidsMore++;
+		} else {
+			fStatSwapSids[i] = sid0;
+		}
+	}
+	fStatSwapPid = proc_selfpid();
 	memcpy(fSwap[slot], swap, SWAP_SIZE);
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
@@ -2483,6 +2661,34 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 				break;
 			}
 		}
+	}
+	IOLockUnlock(fSwapLock);
+}
+
+/*
+ * IOMobileFramebufferSwapWait: until swap `id` is on the panel (see gSwapWait), or it was never queued, or
+ * nothing is left on its way to the panel (a swap the presenter gave up on), at most 100 ms.
+ */
+void
+IOMobileFramebuffer::swapWait(uint32_t id)
+{
+	uint64_t began = mach_absolute_time(), until;
+	bool blocked = false;
+
+	clock_interval_to_deadline(100, kMillisecondScale, &until);
+	IOLockLock(fSwapLock);
+	fStatSwapWaits++;
+	while ((int32_t) (fShownSwapID - id) < 0 && (int32_t) (fQueuedSwapID - id) >= 0 &&
+	    (fSwapsWaiting != 0 || fSwapsDone != fSwapsQueued)) {
+		blocked = true;
+		if (IOLockSleepDeadline(fSwapLock, &fShownSwapID, until, THREAD_UNINT) == THREAD_TIMED_OUT) {
+			fStatSwapWaitTimeouts2++;
+			break;
+		}
+	}
+	if (blocked) {
+		fStatSwapWaitsBlocked++;
+		fStatSwapWaitTime += mach_absolute_time() - began;
 	}
 	IOLockUnlock(fSwapLock);
 }
@@ -2516,7 +2722,9 @@ IOMobileFramebuffer::presenter(void)
 		}
 		IOLockLock(fSwapLock);
 		fSwapsDone++;
+		fShownSwapID = swapWord(swap, SWAP_ID);
 		IOLockWakeup(fSwapLock, &fSwapsDone, false);
+		IOLockWakeup(fSwapLock, &fShownSwapID, false);
 		IOLockUnlock(fSwapLock);
 		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 			if (surfaces[layer] != NULL) {
@@ -2729,8 +2937,27 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			fbSay("fb_scaler: %u frames read by the controller itself, %u drawn by the processor; %llu us waited for the switch a "
 			    "frame; %u not taken%s%s\n", fStatScan, fStatScanCpu, fStatScan ? micros(fStatScanWait) / fStatScan : 0,
 			    fStatScanNotTaken, fScalerReady ? "" : "; off: ", fScalerReady ? "" : fScalerWhy);
+			fbSay("fb_swap: SwapEnd %s; %u SwapWaits, %u of them blocked (%llu us each), %u timed out; %u swaps found their "
+			    "surface still on the panel or queued (would tear)\n", gSwapWait ? "waits for the panel (fb_swapwait=1)" :
+			    "returns once queued", fStatSwapWaits, fStatSwapWaitsBlocked,
+			    fStatSwapWaitsBlocked ? micros(fStatSwapWaitTime) / fStatSwapWaitsBlocked : 0, fStatSwapWaitTimeouts2,
+			    fStatIntoShown);
+			fbSay("fb_vsync: refresh notifications asked for %u times so far; %u sent, %u stopped (no port or callback)\n",
+			    gVSyncAsked, gVSyncSent, gVSyncStopped);
+			fbSay("fb_swap: by pid %d; %u swaps the same as the one before (surfaces, rectangles, layers); the bottom "
+			    "layer's surfaces %u %u %u %u %u %u %u %u (+%u more)\n", fStatSwapPid, fStatSwapSame, fStatSwapSids[0],
+			    fStatSwapSids[1], fStatSwapSids[2], fStatSwapSids[3], fStatSwapSids[4], fStatSwapSids[5],
+			    fStatSwapSids[6], fStatSwapSids[7], fStatSwapSidsMore);
+			fStatSwapSame = fStatSwapSidsMore = 0;
+			bzero(fStatSwapSids, sizeof(fStatSwapSids));
+			fbSay("fb_irq: waits for the controller to take a frame: %u ended by its frame-start interrupt, %u looked again "
+			    "after %u ms, %u gave up after %u ms%s\n", fStatLatchIrq, fStatLatchCap, LATCH_CAP_MS, fStatLatchLimit,
+			    FLIP_LATCH_MS, fFrameIrq ? "" : " (fb_irq off: looked every 100 us)");
+			fStatLatchIrq = fStatLatchCap = fStatLatchLimit = 0;
 			fStatScan = fStatScanCpu = 0;
 			fStatScanWait = 0;
+			fStatSwapWaits = fStatSwapWaitsBlocked = fStatSwapWaitTimeouts2 = fStatIntoShown = 0;
+			fStatSwapWaitTime = 0;
 		}
 		if (fTe) {
 			teReport(nanos);
@@ -2952,7 +3179,9 @@ IOMobileFramebufferUserClient::vsync(void)
 	now = fVSyncTime;
 	if (fClosed || fCallbacks[kFBNotifyVSync] == 0 || fPorts[kFBNotifyVSync] == NULL) {
 		fVSyncRunning = false;
+		OSIncrementAtomic(&gVSyncStopped);
 	} else {
+		OSIncrementAtomic(&gVSyncSent);
 		fVSyncCount++;
 		setAsyncReference64(ref, fPorts[kFBNotifyVSync], fCallbacks[kFBNotifyVSync], fRefcons[kFBNotifyVSync], fTask);
 		args[0] = (uint32_t) now;
@@ -2967,6 +3196,10 @@ IOMobileFramebufferUserClient::vsync(void)
 	IOLockUnlock(fLock);
 	if (send) {
 		sendAsyncResult64WithOptions(ref, kIOReturnSuccess, args, 6, kIOUserNotifyOptionCanDrop);
+		if (gTouchLat) {
+			/* the refresh it is for, and when it was sent: tools/frame_split.py's refresh -> swap */
+			redwood_tl("tl: vs %llu due %llu sent %llu\n", fVSyncCount, micros(now), micros(mach_absolute_time()));
+		}
 	}
 }
 
@@ -2983,7 +3216,8 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 
 		gFBCalls[selector]++;
 		proc_selfname(procname, sizeof(procname));
-		IOLog("MiniIOMobileFramebuffer: %s[%d] selector %u (scalars %u in [0x%llx 0x%llx 0x%llx 0x%llx], %u out; "
+		/* into the loader's log (fbSay): the message buffer wraps before anybody reads the first calls */
+		fbSay("fb: %s[%d] selector %u (scalars %u in [0x%llx 0x%llx 0x%llx 0x%llx], %u out; "
 		    "structure %u in, %u out)\n", procname, proc_selfpid(), selector, args->scalarInputCount,
 		    args->scalarInputCount > 0 ? in[0] : 0, args->scalarInputCount > 1 ? in[1] : 0,
 		    args->scalarInputCount > 2 ? in[2] : 0, args->scalarInputCount > 3 ? in[3] : 0, args->scalarOutputCount,
@@ -3044,10 +3278,13 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		fOwner->present((const uint8_t *) args->structureInput);
 		return kIOReturnSuccess;
 
-	case kFBMethodSwapWait:                         /* a swap is on the screen as soon as it is made */
+	case kFBMethodSwapWait:                         /* in: the swap; returns once it is on the panel */
 		if (gTouchLat) {
 			redwood_tl("tl: w %llu %#llx %#llx at %llu\n", args->scalarInputCount > 0 ? in[0] : 0,
 			    args->scalarInputCount > 1 ? in[1] : 0, args->scalarInputCount > 2 ? in[2] : 0, micros(mach_absolute_time()));
+		}
+		if (!gSwapWait && args->scalarInputCount > 0) {
+			fOwner->swapWait((uint32_t) in[0]);
 		}
 		return kIOReturnSuccess;
 	case kFBMethodSwapSignal:
@@ -3069,6 +3306,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		IOLockLock(fLock);
 		fCallbacks[in[2]] = in[0];
 		fRefcons[in[2]] = in[1];
+		if (in[2] == kFBNotifyVSync) {
+			OSIncrementAtomic(&gVSyncAsked);
+		}
 		if (in[2] == kFBNotifyVSync && in[0] != 0 && !fVSyncRunning && !fClosed) {
 			fVSyncRunning = true;
 			armVSync();
@@ -3447,6 +3687,25 @@ IOMobileFramebuffer::loaderQuiesce(void)
 		delay(100);
 	}
 	fScalerOn = false;
+}
+
+/*
+ * The panel held under `nits` (0: as asked again) while the chip is hot, from the thermal loop
+ * (bsd/dev/redwood_exynos_acpm.c): what CoreBrightness asks is kept, and comes back when the cap goes.
+ */
+extern "C" void redwood_fb_thermal_cap(uint32_t nits);
+void
+redwood_fb_thermal_cap(uint32_t nits)
+{
+	uint32_t cap = nits << 16;
+
+	if (cap == gBLThermalCap) {
+		return;
+	}
+	gBLThermalCap = cap;
+	if (gFramebuffer != NULL && gFramebuffer->fBLCall != NULL && gFramebuffer->fDsim != NULL) {
+		thread_call_enter(gFramebuffer->fBLCall);
+	}
 }
 
 extern "C" void redwood_fb_quiesce(void);

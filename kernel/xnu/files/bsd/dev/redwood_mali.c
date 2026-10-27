@@ -43,6 +43,7 @@
 #include <os/atomic_private.h>
 #include <pexpert/pexpert.h>
 #include <sys/redwood_mali.h>
+#include <sys/redwood_m2m.h>
 #include <sys/proc.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
@@ -729,6 +730,19 @@ static struct job {
 } jobs[JOBS];
 static unsigned job_head, job_tail;     /* taken from head, added at tail */
 static uint64_t submitted, completed;
+/* the completed count where every client can read it without a call (RedwoodMali.cpp maps it read-only as
+ * client memory type 0): Panfrost asks "is this buffer idle?" of every buffer it takes from its cache, and the
+ * answer is this number against the buffer's last job (PLANS/10-mali2metal.md, item 2 B) */
+static volatile uint64_t *completed_shared;
+
+void
+redwood_mali_share_completed(volatile uint64_t *where)
+{
+	completed_shared = where;
+	if (where != NULL) {
+		__atomic_store_n(where, os_atomic_load(&completed, acquire), __ATOMIC_RELEASE);
+	}
+}
 static uint64_t stat_jobs, stat_faults, stat_resets;
 
 uint64_t
@@ -864,6 +878,10 @@ job_failed(const struct job *j, const char *what)
 
 	stat_faults++;
 	last_fault_jc = j->jc;
+	m2m_klog_for(j->pid, j->name, 'E', "GPU", "job %llu %s: chain %#llx slot %u (%s); JS status %#x; AS0 fault %#x at %#x:%08x; "
+	    "GPU fault %#x at %#x:%08x; reset %llu", j->seqno, what, j->jc, slot, slot == 0 ? "fragment" : "vertex/tiler/compute",
+	    mr(JS(slot, JS_STATUS)), mr(AS(0, AS_FAULTSTATUS)), mr(AS(0, AS_FAULTADDRESS_HI)), mr(AS(0, AS_FAULTADDRESS_LO)),
+	    mr(GPU_FAULT_STATUS), mr(GPU_FAULT_ADDRESS_HI), mr(GPU_FAULT_ADDRESS_LO), stat_resets + 1);
 	if (stat_faults <= 32) {
 		char line[320];
 
@@ -889,6 +907,7 @@ job_failed(const struct job *j, const char *what)
 	stat_resets++;
 	if (!hw_init("after a fault")) {
 		printf("mali: the GPU could not be set up again: it is given nothing more\n");
+		m2m_klog('F', "GPU", "the GPU could not be set up again after a fault: no more GPU work this run");
 		mali_up = false;
 	}
 }
@@ -936,11 +955,60 @@ gpu_cycles(void)
 	return ((uint64_t)hi << 32) | lo;
 }
 
+/*
+ * The GPU's busy time since boot, per kind of job (fragment, vertex/tiler/compute), never reset: what the
+ * clock governor (redwood_exynos_acpm.c) reads its load from, through redwood_mali_busy_pct.
+ */
+static uint64_t gpu_busy_total[2];
+
+/* The GPU's load since the caller's last call, in percent of wall time: the busier of the two kinds of job
+ * (they overlap). -1 before the first job. One caller (the governor's thread). */
+int redwood_mali_busy_pct(void);
+int
+redwood_mali_busy_pct(void)
+{
+	static uint64_t last_at, last_busy[2];
+	uint64_t now = mach_absolute_time(), b0 = gpu_busy_total[0], b1 = gpu_busy_total[1], d0, d1, wall;
+
+	if (last_at == 0) {
+		last_at = now;
+		last_busy[0] = b0;
+		last_busy[1] = b1;
+		return -1;
+	}
+	wall = now - last_at;
+	d0 = b0 - last_busy[0];
+	d1 = b1 - last_busy[1];
+	last_at = now;
+	last_busy[0] = b0;
+	last_busy[1] = b1;
+	if (wall == 0) {
+		return -1;
+	}
+	d0 = d0 > d1 ? d0 : d1;
+	return d0 >= wall ? 100 : (int)(d0 * 100 / wall);
+}
+
+/*
+ * Jobs that ran longer than half a refresh, for the clock governor (redwood_exynos_acpm.c), which is woken
+ * by each: the GPU's load comes in bursts, and a 200 ms average left a heavy frame's jobs at the lowest
+ * clocks (27 October, cold: GPU 85-93 % idle, single fragment jobs of 17-23 ms at 156-260 MHz).
+ */
+#define GPU_SLOW_JOB_NS         (8 * NSEC_PER_MSEC)
+uint32_t redwood_mali_slow_jobs;
+extern int redwood_gov_wake;
+
 static void
 gpu_time_done(unsigned slot, uint64_t ran, uint64_t now)
 {
 	uint64_t ns;
 
+	absolutetime_to_nanoseconds(ran, &ns);
+	if (ns > GPU_SLOW_JOB_NS) {
+		redwood_mali_slow_jobs++;
+		thread_wakeup((event_t)&redwood_gov_wake);
+	}
+	gpu_busy_total[slot] += ran;
 	gpu_time.count[slot]++;
 	gpu_time.busy[slot] += ran;
 	gpu_time.longest[slot] = ran > gpu_time.longest[slot] ? ran : gpu_time.longest[slot];
@@ -969,6 +1037,7 @@ gpu_time_done(unsigned slot, uint64_t ran, uint64_t now)
 		}
 		strlcat(line, "\n", sizeof(line));
 		loader_log_line(line);
+		m2m_klog('I', "PERF", "gpu %.*s", (int)(strlen(line) > 7 ? strlen(line) - 7 : 0), line + 6);
 		memset(&gpu_time, 0, sizeof(gpu_time));
 		gpu_time.window_start = now;
 		gpu_time.idle_since = now;
@@ -1051,6 +1120,9 @@ scheduler(__unused void *parameter, __unused wait_result_t result)
 		}
 		job_head++;
 		os_atomic_store(&completed, running->seqno, release);
+		if (completed_shared != NULL) {
+			__atomic_store_n(completed_shared, running->seqno, __ATOMIC_RELEASE);
+		}
 		running = NULL;
 		thread_wakeup((event_t)&completed);
 	}

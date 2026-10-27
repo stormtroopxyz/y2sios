@@ -220,10 +220,18 @@ The driver reads `SOCREP`, `VCELL`, `CURRENT`, `AVG_CURRENT`, `FULLCAP_REP` and 
 | Channels | 11 for the AP |
 | A55 cluster | domain 2, up to 1.742 GHz |
 | A76 cluster | domain 3, up to 2.21 GHz |
-| GPU | domain 10, 260 to 702 MHz |
+| M5 cluster | domain 4, up to 2.304 GHz |
+| GPU | domain 10, 156 to 702 MHz |
+| Memory (MIF) | domain 0, not driven by this port |
 | Temperature sensors | big, mid, little, G3D |
 
-The driver discovered the channels by walking the shared-memory descriptors. It sends requests through the mailbox at the addresses printed in the `dvfs:` log lines. The M5 cluster is a separate domain and is not used because of the Safari crash described in the README.
+The driver discovered the channels by walking the shared-memory descriptors. It sends requests through the mailbox at the addresses printed in the `dvfs:` log lines. Temperatures are read through the TMU channel (`READ_TEMP`). The governor, Samsung's thermal steps and the touch booster floors are described in the README. ACPM does not answer `FREQ_GET`, so the GPU's real clock is read from `PLL_G3D`.
+
+| Idle state | |
+|---|---|
+| PSCI | version 1.1, `CPU_SUSPEND` power state `0x10000` (`c2`) |
+| Wake timer | MCT at `0x10040000`, local timer SPIs `32 + 0x1d6 + n`, 13 MHz |
+| PMU | `CPU_INFORM` at `0x15860860 + 4n`; core sequences from Samsung's flexpmu |
 
 ## Pin control blocks
 

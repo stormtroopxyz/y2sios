@@ -131,20 +131,31 @@ line_release(struct redwood_bbi2c *b, uint32_t pin)
 	redwood_gpio_func(b->bank, pin, REDWOOD_GPIO_INPUT);
 }
 
-/* Let SCL go high and wait while a slave stretches it. */
+/*
+ * Let SCL go high and wait while a slave stretches it: up to 25 ms by the clock (SMBus's tLOW:SEXT), not
+ * by a count of waits. A count of 1000 one-microsecond waits lasted tens of milliseconds while every short
+ * delay() slept on a timer; once the cores' power-down latency was known (powergate_latency, 27 October)
+ * short delays spin for what they say, the count became 1 ms, and the touch controller's and the fuel
+ * gauge's stretched reads failed (sec_ts: "NO ANSWER" with its ID read; bms: "no answer").
+ */
 static void
 scl_release(struct redwood_bbi2c *b)
 {
-	uint32_t i;
+	uint64_t limit;
 
 	line_release(b, b->scl);
-	for (i = 0; i < 1000; i++) {
-		if (redwood_gpio_get(b->bank, b->scl)) {
+	if (redwood_gpio_get(b->bank, b->scl)) {
+		return;
+	}
+	nanoseconds_to_absolutetime(25 * NSEC_PER_MSEC, &limit);
+	limit += mach_absolute_time();
+	while (!redwood_gpio_get(b->bank, b->scl)) {
+		if (mach_absolute_time() >= limit) {
+			b->stretch_timeouts++;
 			return;
 		}
 		delay_for_interval(1, NSEC_PER_USEC);
 	}
-	b->stretch_timeouts++;
 }
 
 /* A (repeated) start: works from idle and from SCL low after a byte. */

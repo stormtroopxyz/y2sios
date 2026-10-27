@@ -259,6 +259,11 @@ give_network(const struct apple80211req *request, const struct redwood_sta_bss *
 	result->version = 1;
 	channel_fill(&result->channel, bss->frequency, 0);
 	result->rssi = bss->rssi;
+	if (bss->noise != 0) {
+		/* as a Mac's driver gives them (itlwm, AirportSTAIOCTL.cpp: asr_noise); 0 left a strong signal at one bar */
+		result->noise = bss->noise;
+		result->snr = (int16_t)(bss->rssi - bss->noise);
+	}
 	result->beacon_interval = bss->beacon_interval;
 	result->capability = bss->capability;
 	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
@@ -431,6 +436,16 @@ get(struct apple80211req *request)
 			     .each_ext = { state->bss.rssi }, .all_ext = state->bss.rssi };
 
 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		break;
+	}
+	case 17: {                              /* the noise floor, the same way (apple80211_noise_data; 0: dBm) */
+		struct {
+			uint32_t version, radios, unit;
+			int32_t each[4], all, each_ext[4], all_ext;
+		} answer = { .version = 1, .radios = 1, .each = { state->bss.noise }, .all = state->bss.noise,
+			     .each_ext = { state->bss.noise }, .all_ext = state->bss.noise };
+
+		error = state->phase != REDWOOD_STA_JOINED || state->bss.noise == 0 ? ENXIO : give(request, &answer, sizeof(answer));
 		break;
 	}
 	case 103:                               /* all of it, as a scan's result */
@@ -648,6 +663,10 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
 		if (state != NULL) {
 			redwood_sta_state(state);
 			link.rssi = status == 1 ? state->bss.rssi : 0;
+			if (status == 1 && state->bss.noise != 0) {
+				link.noise = (uint16_t)state->bss.noise;
+				link.snr = (uint16_t)(state->bss.rssi - state->bss.noise);
+			}
 			kfree_data(state, sizeof(*state));
 		}
 		post(EVENT_SSID_CHANGED, NULL, 0);

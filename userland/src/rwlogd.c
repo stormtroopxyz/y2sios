@@ -5,6 +5,14 @@
  *                             console's (kern.redwood_log), then the message buffer (kern.redwood_dmesg)
  *   GET /tail?log=N&dmesg=M   what each has had written since its character N / M (X-Log-Total and
  *                             X-Dmesg-Total: where to ask from next time); all of one that lost N/M
+ *   GET /m2m[?from=N]         mali2metal's channel (kern.m2m_log): all of it, or what came after byte N
+ *                             (X-M2M-Total: where to ask from next time)
+ *   GET /tour                 start mali2metal's standard tour (/redwood/etc/m2m.tour, run by
+ *                             /redwood/sbin/init) unless it is running; nothing else can be run
+ *   GET /notify?name=N        post the notification N, which must be com.redwood.metal.<something> (the Metal
+ *                             driver's own: summary, prof, trace, snap, dump); nothing else is posted
+ *   GET /menu[?to=N]          hand back to the loader: 1 Log access (the default), 2 the menu,
+ *                             3 Download Mode (kern.redwood_menu)
  *   GET /               a line saying what this is
  *
  * Port 8080, advertised over Bonjour as "HackiOS" (_http._tcp): `dns-sd -B _http._tcp` finds it, and
@@ -15,7 +23,9 @@
 #include <errno.h>
 #include <ifaddrs.h>
 #include <netinet/in.h>
+#include <notify.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -24,6 +34,7 @@
 #include <sys/socket.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define PORT    8080
@@ -94,6 +105,96 @@ since(uint64_t from, uint64_t total, size_t len)
 }
 
 static void
+reply(int fd, const char *status, const char *body)
+{
+	char head[200];
+
+	snprintf(head, sizeof(head), "HTTP/1.0 %s\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+	    status, strlen(body));
+	if (write_all(fd, head, strlen(head)) == 0) {
+		write_all(fd, body, strlen(body));
+	}
+}
+
+/* GET /m2m[?from=N]: mali2metal's channel, whole or from byte N (sys/redwood_m2m.h) */
+static void
+serve_m2m(int fd, const char *req)
+{
+	char head[200], *q;
+	size_t len = 0, n;
+	uint64_t total = 0, from = 0;
+	char *all = fetch("kern.m2m_log", &len);
+
+	if (all == NULL || len < 8) {
+		free(all);
+		reply(fd, "500 No Channel", "kern.m2m_log: no mali2metal channel in this kernel\n");
+		return;
+	}
+	memcpy(&total, all, 8);
+	len -= 8;
+	if ((q = strstr(req, "from=")) != NULL && q < strstr(req, " HTTP")) {
+		from = strtoull(q + 5, NULL, 10);
+	}
+	n = q != NULL ? since(from, total, len) : len;
+	snprintf(head, sizeof(head), "HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %zu\r\n"
+	    "X-M2M-Total: %llu\r\nConnection: close\r\n\r\n", n, (unsigned long long)total);
+	if (write_all(fd, head, strlen(head)) == 0) {
+		write_all(fd, all + 8 + len - n, n);
+	}
+	free(all);
+}
+
+/* GET /notify?name=com.redwood.metal.X: one of the Metal driver's notifications, and only those */
+static void
+serve_notify(int fd, const char *req)
+{
+	static const char prefix[] = "com.redwood.metal.";
+	char name[96] = "";
+	const char *q = strstr(req, "name=");
+	size_t n = 0;
+
+	if (q != NULL) {
+		q += 5;
+		while (n + 1 < sizeof(name) && q[n] != ' ' && q[n] != '&' && q[n] != '\r' && q[n] != '\n' && q[n] != '\0') {
+			name[n] = q[n];
+			n++;
+		}
+		name[n] = '\0';
+	}
+	if (strncmp(name, prefix, sizeof(prefix) - 1) != 0 || n == sizeof(prefix) - 1) {
+		reply(fd, "403 Forbidden", "only com.redwood.metal.* is posted\n");
+		return;
+	}
+	if (notify_post(name) != NOTIFY_STATUS_OK) {
+		reply(fd, "500 Not Posted", "notify_post failed\n");
+		return;
+	}
+	reply(fd, "200 OK", "posted\n");
+}
+
+/* GET /tour: the standard tour, one at a time; the only thing this daemon runs */
+static pid_t tour_pid;
+
+static void
+serve_tour(int fd)
+{
+	static char *const argv[] = { "init", "/redwood/etc/m2m.tour", NULL };
+	extern char **environ;
+
+	if (tour_pid > 0 && waitpid(tour_pid, NULL, WNOHANG) == 0) {
+		reply(fd, "409 Busy", "the tour is running\n");
+		return;
+	}
+	tour_pid = 0;
+	if (posix_spawn(&tour_pid, "/redwood/sbin/init", NULL, NULL, argv, environ) != 0) {
+		tour_pid = 0;
+		reply(fd, "500 Not Started", "the tour could not be started\n");
+		return;
+	}
+	reply(fd, "200 OK", "tour started\n");
+}
+
+static void
 serve(int fd)
 {
 	static const char sep[] = "\n--- kernel message buffer ---\n";
@@ -108,9 +209,45 @@ serve(int fd)
 		return;
 	}
 	req[n] = 0;
+	if (strncmp(req, "GET /m2m", 8) == 0) {
+		serve_m2m(fd, req);
+		return;
+	}
+	if (strncmp(req, "GET /notify", 11) == 0) {
+		serve_notify(fd, req);
+		return;
+	}
+	if (strncmp(req, "GET /tour", 9) == 0) {
+		serve_tour(fd);
+		return;
+	}
+	/*
+	 * GET /menu (or /usb): hand the phone back to the loader's Log access, so a host can read
+	 * the log and flash without anyone pressing a key. The answer is sent first; the write to
+	 * kern.redwood_menu does not return (the machine leaves the kernel).
+	 */
+	if (strncmp(req, "GET /menu", 9) == 0 || strncmp(req, "GET /usb", 8) == 0) {
+		static const char ok[] = "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n";
+		static const char body[] = "returning to the loader\n";
+		int what = 1;
+
+		/* /menu?to=N: 1 Log access, 2 the menu, 3 Download Mode (kern.redwood_menu) */
+		if (strncmp(req, "GET /menu?to=", 13) == 0) {
+			what = atoi(req + 13);
+		}
+
+		if (write_all(fd, ok, sizeof(ok) - 1) == 0) {
+			write_all(fd, body, sizeof(body) - 1);
+		}
+		close(fd);
+		sysctlbyname("kern.redwood_menu", NULL, NULL, &what, sizeof(what));
+		return;
+	}
 	tail = strncmp(req, "GET /tail", 9) == 0;
 	if (!tail && strncmp(req, "GET /log", 8) != 0) {
-		static const char what[] = "rwlogd: GET /log (the kernel's logs), GET /tail?log=N&dmesg=M (what is new since)\n";
+		static const char what[] = "rwlogd: GET /log (the kernel's logs), GET /tail?log=N&dmesg=M (what is new since), "
+		    "GET /m2m[?from=N] (mali2metal's channel), GET /tour (the standard tour), GET /notify?name=com.redwood.metal.X, "
+		    "GET /menu[?to=1|2|3] (hand back to the loader: Log access, the menu, Download Mode)\n";
 
 		snprintf(head, sizeof(head), "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n"
 		    "Connection: close\r\n\r\n", sizeof(what) - 1);

@@ -1,0 +1,1 @@
+touch_ts=1 bms=1 mali=1 cpumask=0xff fb_threads=6 fb_te=1 fb_bl=1 fb_scaler=1 metal=1 camtl=1 metal_profile=1 mediamtl=1 dvfs=2 perf=1 perf_secs=30 mali_irq=1 mali_cached=1 wifi_pcie=4 wifi_pcie_wait=3 ufs=2 ufs_native=1 ufs_root=super:184b00000:948c0000 ufs_write=1 var_hfs=1 bt=1 snd=1 dvfs_cl2=2304000 jit_flush=1 cpuidle=1 autounlock=0

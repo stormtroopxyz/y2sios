@@ -8,7 +8,7 @@ The main technical account is the [README](../README.md). These documents go dee
 - [hardware.md](hardware.md): addresses, pins, buses and interrupts for the Exynos 990 S20+.
 - [building.md](building.md): a full build from upstream sources, including the UEFI in a Linux VM.
 - [history/](history/): the original handover and port log, kept as written.
-- [plans/](plans/): the working plans for display, GPU, wireless, audio and standalone operation.
+- [plans/](plans/): the working plans for display, GPU, wireless, audio and standalone operation, and [plans/10-mali2metal.md](plans/10-mali2metal.md), the run log of the evidence loop.
 - [research/](research/): hardware reports on the ABOX, the display controller, Wi-Fi and Bluetooth.
 
 ## A note on dates
@@ -20,4 +20,5 @@ The files in `history/` and `plans/` are working notes. They were written during
 | 23 to 24 October 2026 | UEFI, loader and XNU boot on the phone; iOS 16.5 reaches SpringBoard; touch works |
 | 24 to 25 October 2026 | Display tear fix, brightness and screen power; GPU through Panfrost; Wi-Fi bring-up; Bluetooth design |
 | 25 October 2026 | Zero-copy display scaling; UFS root and HFS+ `/var`; boot menu and USB flashing; Wi-Fi with WPA2 and DHCP |
-| 26 October 2026 | Bluetooth HCI and `bluetoothd` attach; ACPM DVFS; audio path programmed but silent |
+| 26 October 2026 | Bluetooth HCI and `bluetoothd` attach; ACPM DVFS; audio path programmed but silent; the m2m channel and the loop; Metal fixes for `mediaserverd`, `chronod` and the window server's per-draw cost |
+| 27 October 2026 | All eight cores with Safari's JIT fixed; CPU and GPU governors with thermal steps and touch boost; idle power-down through PSCI; widgets through textures over buffers; storage size, charger state, Wi-Fi signal and security; boot to the lock screen; CoreAnimation on vsync; frame pacing measured |

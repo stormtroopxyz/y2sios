@@ -28,16 +28,22 @@
  *                Samsung's: A55 86 / 96 by the LITTLE zone, A76 86 / 96 by MID, GPU 88 / 100 by G3D,
  *                exynos9830.dts thermal-zones); a step is let go 6 degrees below where it was taken.
  *                Step 1 is the "mid" clock, step 2 the safe one. Only the domain that is hot slows.
+ *   fb_hot=C     the panel held under 70 % of its brightness from C degrees in the hottest zone (default
+ *                90; 0: never), under 50 % from C + 6; the 50 % let go below C + 2, the 70 % below C - 4.
+ *                The panel's power is heat in the same body as the SoC (a phone's thermal policy does the
+ *                same; Samsung's is in user space, SSRM, so these marks are this driver's own).
  * Every line goes to the loader's log with a `dvfs:` prefix.
  */
 
 #include <kern/clock.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
 #include <sys/systm.h>
+#include <sys/redwood_m2m.h>
 #include <mach/processor_info.h>
 #include <mach/machine.h>
 
@@ -124,6 +130,10 @@ dlog(const char *format, ...)
 	va_start(list, format);
 	vsnprintf(line + 6, sizeof(line) - 7, format, list);
 	va_end(list);
+	/* into mali2metal's channel as well, but not each clock request (the governor's, several a second) */
+	if (strncmp(line + 6, "domain ", 7) != 0) {
+		m2m_klog('I', "PERF", "%s", line);
+	}
 	len = strlen(line);
 	line[len] = '\n';
 	line[len + 1] = '\0';
@@ -319,9 +329,10 @@ read_temp(unsigned zone)
 static void
 report(const char *why)
 {
-	char line[256];
+	char line[300];
 	size_t at = 0;
 
+	/* (ACPM does not answer FREQ_GET as acpm_dvfs.c asks it: every domain read 0, run 20) */
 	at += snprintf(line + at, sizeof(line) - at, "PLL_G3D %u MHz", g3d_pll_mhz());
 	if (ch_tmu.len != 0) {
 		at += snprintf(line + at, sizeof(line) - at, "; temperatures");
@@ -371,27 +382,75 @@ hottest(void)
  * cluster's busiest core; over 70 % busy the top rung at once (a touch must not wait for the clock),
  * otherwise the rung that would make it ~60 % busy, coming down one rung at a time after 0.6 s. The
  * thermal steps cap it.
+ *
+ * The GPU (dvfs_gov_gpu=1, the default) the same way from its own busy time (redwood_mali_busy_pct), over
+ * Samsung's table (dtb gpu_dvfs_table: 156 to 702 MHz here; 800 and 832 are not used), but aiming at ~40 %
+ * busy and jumping to the top at 60 %: the window server waits for the GPU in every swap, so a GPU kept
+ * busier is a longer frame. It ran at 702 MHz 90-96 % idle (runs 1-31), the SoC at 81 C idle.
+ *
+ * A touch: Samsung's input booster for this phone (dts input_booster, booster_key@3 "touch": head_time
+ * 130 ms, tail_time 500 ms) holds each cluster at least at its head clock for 130 ms after a finger comes
+ * down and at its tail clock until 500 ms after the last touch event; here each as the lowest rung at or
+ * above it, applied the moment the finger lands (the governor is woken) rather than at the next tick.
+ * The booster's MIF (memory, 1014 MHz) floor is not applied: the memory's clock is not driven here.
+ * The booster sets no GPU floor; this one holds the GPU at 572 MHz for a touch: measured cold (27 October)
+ * a heavy frame's fragment jobs ran 17-23 ms at 156-260 MHz, and 572 is the lowest of Samsung's rungs that
+ * would bring them near 8 ms by the clock alone (an estimate: the memory's speed may cap it).
+ *
+ * A GPU job longer than half a refresh (redwood_mali.c: redwood_mali_slow_jobs, which wakes this thread)
+ * takes the GPU to its top rung at once; it comes down as from any other jump.
  */
+int redwood_gov_wake;                   /* the event a touch or a slow GPU job wakes the governor with */
 #define GOV_TICK_MS     200
-#define GOV_RUNGS       4
+#define GOV_RUNGS       6
 static const struct {
 	unsigned domain;
-	unsigned first_cpu, ncpus;
+	unsigned first_cpu, ncpus;      /* ncpus 0: the GPU */
 	uint32_t rung[GOV_RUNGS];       /* kHz, low to high; 0: unused */
+	unsigned aim, jump;             /* the busy % a rung is chosen for, and the % that takes the top at once */
+	uint32_t touch_head, touch_tail;        /* kHz the input booster holds at least (0: none) */
 } gov[] = {
-	{ D_CL0, 0, 4, { 806000, 1053000, 1352000, 1742000 } },
-	{ D_CL1, 4, 2, { 1066000, 1612000, 2210000, 0 } },
-	{ D_CL2, 6, 2, { 1196000, 1794000, 2304000, 0 } },
+	{ D_CL0, 0, 4, { 806000, 1053000, 1352000, 1742000, 0, 0 }, 60, 70, 806000, 806000 },
+	{ D_CL1, 4, 2, { 1066000, 1612000, 2210000, 0, 0, 0 }, 60, 70, 1404000, 1222000 },
+	{ D_CL2, 6, 2, { 1196000, 1794000, 2304000, 0, 0, 0 }, 60, 70, 1066000, 858000 },
+	{ D_G3D, 0, 0, { 156000, 260000, 377000, 455000, 572000, 702000 }, 40, 60, 572000, 572000 },
 };
+#define TOUCH_HEAD_MS   130
+#define TOUCH_TAIL_MS   500
+extern uint64_t redwood_touch_down_at, redwood_touch_last_at;
+extern uint32_t redwood_mali_slow_jobs;
+
+/* the lowest rung the touch booster holds cluster `g` at now (0: no boost) */
+static unsigned
+gov_touch_floor(unsigned g)
+{
+	uint64_t now = mach_absolute_time(), head, tail;
+	uint32_t khz;
+	unsigned r = 0;
+
+	nanoseconds_to_absolutetime(TOUCH_HEAD_MS * NSEC_PER_MSEC, &head);
+	nanoseconds_to_absolutetime(TOUCH_TAIL_MS * NSEC_PER_MSEC, &tail);
+	khz = redwood_touch_down_at != 0 && now - redwood_touch_down_at < head ? gov[g].touch_head :
+	    redwood_touch_last_at != 0 && now - redwood_touch_last_at < tail ? gov[g].touch_tail : 0;
+	while (khz != 0 && r + 1 < GOV_RUNGS && gov[g].rung[r + 1] != 0 && gov[g].rung[r] < khz) {
+		r++;
+	}
+	return r;
+}
+extern int redwood_mali_busy_pct(void);
 #define NGOV            (sizeof(gov) / sizeof(gov[0]))
 
 static uint32_t gov_ticks[8][2];        /* busy, all: the last reading of each core */
 
-/* the busiest core of the cluster since the last call, in percent; -1: no reading */
+/* the busiest core of the cluster since the last call (or the GPU's load), in percent; -1: no reading */
 static int
 gov_busy(unsigned g)
 {
 	int worst = -1;
+
+	if (gov[g].ncpus == 0) {
+		return redwood_mali_busy_pct();
+	}
 
 	for (unsigned c = gov[g].first_cpu; c < gov[g].first_cpu + gov[g].ncpus && c < 8 && c < real_ncpus; c++) {
 		processor_cpu_load_info_data_t load;
@@ -421,9 +480,11 @@ gov_busy(unsigned g)
 static void
 acpm_thread(void *arg, wait_result_t wr_unused)
 {
-	uint32_t mode = 0, wait = 10, hot_at = 0;
+	uint32_t mode = 0, wait = 10, hot_at = 0, fb_hot = 90;
+	int bl_step = 0;
 	int hot = 0, level[NDOMAINS] = { 0 }, temp[4];
-	uint32_t govern = 1, gov_rung[NGOV], gov_low[NGOV], gov_sent[NGOV], gov_changes = 0, tick = 0;
+	uint32_t govern = 1, govern_gpu = 1, gov_rung[NGOV], gov_low[NGOV], gov_sent[NGOV], gov_changes = 0, tick = 0;
+	uint32_t gov_boosts = 0, gov_touches = 0, gov_slow_seen = 0, gov_slow_raises = 0, gov_slow_last = 0;
 	uint64_t gov_khz_sum[NGOV];
 
 	(void)arg;
@@ -432,6 +493,8 @@ acpm_thread(void *arg, wait_result_t wr_unused)
 	PE_parse_boot_argn("dvfs_wait", &wait, sizeof(wait));
 	PE_parse_boot_argn("dvfs_hot", &hot_at, sizeof(hot_at));
 	PE_parse_boot_argn("dvfs_gov", &govern, sizeof(govern));
+	PE_parse_boot_argn("fb_hot", &fb_hot, sizeof(fb_hot));
+	PE_parse_boot_argn("dvfs_gov_gpu", &govern_gpu, sizeof(govern_gpu));
 	for (unsigned g = 0; g < NGOV; g++) {
 		gov_rung[g] = GOV_RUNGS - 1;
 		while (gov_rung[g] > 0 && gov[g].rung[gov_rung[g]] == 0) {
@@ -544,7 +607,48 @@ acpm_thread(void *arg, wait_result_t wr_unused)
 		report("after cluster 2");
 	}
 	for (;; tick++) {
-		delay_for_interval(GOV_TICK_MS, NSEC_PER_MSEC);
+		uint64_t tick_end;
+
+		/* a tick, or sooner a finger coming down or a slow GPU job: its boost at once */
+		clock_interval_to_deadline(GOV_TICK_MS, NSEC_PER_MSEC, &tick_end);
+		for (;;) {
+			bool slow;
+
+			assert_wait_deadline((event_t)&redwood_gov_wake, THREAD_UNINT, tick_end);
+			if (thread_block(THREAD_CONTINUE_NULL) != THREAD_AWAKENED) {
+				break;
+			}
+			slow = redwood_mali_slow_jobs != gov_slow_seen;
+			gov_slow_seen = redwood_mali_slow_jobs;
+			gov_touches += !slow;
+			for (unsigned g = 0; govern && mode >= 2 && g < NGOV; g++) {
+				unsigned d, floor = gov_touch_floor(g);
+				uint32_t cap, khz;
+
+				if (slow && gov[g].ncpus == 0) {
+					for (floor = GOV_RUNGS - 1; floor > 0 && gov[g].rung[floor] == 0; floor--) {
+					}
+					gov_slow_raises += floor > gov_rung[g];
+				}
+
+				for (d = 0; d < NDOMAINS && domains[d].domain != gov[g].domain; d++) {
+				}
+				if (d == NDOMAINS || targets[d] == 0 || floor <= gov_rung[g] || (gov[g].ncpus == 0 && !govern_gpu)) {
+					continue;
+				}
+				gov_rung[g] = floor;
+				gov_low[g] = 0;
+				cap = level[d] == 2 ? domains[d].safe : level[d] == 1 ? domains[d].mid : targets[d];
+				khz = gov[g].rung[floor];
+				khz = khz > targets[d] ? targets[d] : khz;
+				khz = cap != 0 && khz > cap ? cap : khz;
+				if (khz != gov_sent[g] && set_rate(domains[d].domain, khz) == 0) {
+					gov_sent[g] = khz;
+					gov_changes++;
+					gov_boosts++;
+				}
+			}
+		}
 		/* the governor: every tick */
 		for (unsigned g = 0; govern && mode >= 2 && g < NGOV; g++) {
 			unsigned d = 0, top = GOV_RUNGS - 1, want;
@@ -559,17 +663,20 @@ acpm_thread(void *arg, wait_result_t wr_unused)
 			while (top > 0 && gov[g].rung[top] == 0) {
 				top--;
 			}
+			if (gov[g].ncpus == 0 && !govern_gpu) {
+				continue;
+			}
 			busy = gov_busy(g);
 			if (busy < 0) {
 				continue;
 			}
 			want = gov_rung[g];
-			if (busy >= 70) {
+			if (busy >= (int)gov[g].jump) {
 				want = top;
 				gov_low[g] = 0;
 			} else {
-				/* the lowest rung that would leave it at most ~60 % busy */
-				uint64_t need = (uint64_t)gov[g].rung[gov_rung[g]] * (uint64_t)busy / 60;
+				/* the lowest rung that would leave it at most `aim` % busy */
+				uint64_t need = (uint64_t)gov[g].rung[gov_rung[g]] * (uint64_t)busy / gov[g].aim;
 				unsigned fit = 0;
 
 				while (fit < top && gov[g].rung[fit] < need) {
@@ -582,6 +689,10 @@ acpm_thread(void *arg, wait_result_t wr_unused)
 					want = gov_rung[g] - 1;
 					gov_low[g] = 0;
 				}
+			}
+			if (want < gov_touch_floor(g)) {
+				want = gov_touch_floor(g);
+				gov_low[g] = 0;
 			}
 			gov_rung[g] = want;
 			cap = level[d] == 2 ? domains[d].safe : level[d] == 1 ? domains[d].mid : targets[d];
@@ -604,6 +715,33 @@ acpm_thread(void *arg, wait_result_t wr_unused)
 		hot = 0;
 		for (unsigned z = 0; z < 4; z++) {
 			temp[z] = ch_tmu.len != 0 ? read_temp(z) : -1;
+		}
+		if (fb_hot != 0) {
+			extern void redwood_fb_thermal_cap(uint32_t nits);
+			static const uint32_t cap_nits[3] = { 0, 294, 210 };        /* none, 70 %, 50 % of the panel's 420 */
+			int t = -1, want = bl_step;
+
+			for (unsigned z = 0; z < 4; z++) {
+				t = temp[z] > t ? temp[z] : t;
+			}
+			/* as the clusters' steps: taken at the mark, let go 4 degrees below it */
+			if (t < 0) {
+				want = bl_step;
+			} else if (t >= (int)fb_hot + 6) {
+				want = 2;
+			} else if (t >= (int)fb_hot && want < 1) {
+				want = 1;
+			} else if (want == 2 && t < (int)fb_hot + 2) {
+				want = t >= (int)fb_hot - 4 ? 1 : 0;
+			} else if (want == 1 && t < (int)fb_hot - 4) {
+				want = 0;
+			}
+			if (want != bl_step) {
+				bl_step = want;
+				redwood_fb_thermal_cap(cap_nits[want]);
+				dlog("display: hottest zone %d C: brightness %s", t, want == 0 ? "as asked again" : want == 1 ?
+				    "held under 70 %" : "held under 50 %");
+			}
 		}
 		for (unsigned i = 0; mode >= 2 && i < NDOMAINS; i++) {
 			int z = domains[i].zone, t, s1, s2, want;
@@ -629,7 +767,7 @@ acpm_thread(void *arg, wait_result_t wr_unused)
 				level[i] = want;
 				/* (a governed cluster gets its clock from the governor, capped by this step, next tick) */
 				bool governed = govern && (domains[i].domain == D_CL0 || domains[i].domain == D_CL1 ||
-				    domains[i].domain == D_CL2);
+				    domains[i].domain == D_CL2 || (domains[i].domain == D_G3D && govern_gpu));
 				if (khz != 0 && !governed && set_rate(domains[i].domain, khz) != 0) {
 					dlog("%s: %u kHz was not taken", domains[i].name, khz);
 				}
@@ -643,11 +781,74 @@ acpm_thread(void *arg, wait_result_t wr_unused)
 		if (govern && mode >= 2) {
 			unsigned n = 10000 / GOV_TICK_MS;
 
-			dlog("governor: 10 s: %u clock changes; average cl0 %llu cl1 %llu cl2 %llu MHz", gov_changes,
-			    gov_khz_sum[0] / n / 1000, gov_khz_sum[1] / n / 1000, gov_khz_sum[2] / n / 1000);
+			dlog("governor: 10 s: %u clock changes (%u raised the moment a finger came down, of %u touches; the GPU "
+			    "raised to its top %u times by %u jobs over 8 ms); average cl0 %llu cl1 %llu cl2 %llu g3d %llu MHz",
+			    gov_changes, gov_boosts, gov_touches, gov_slow_raises, redwood_mali_slow_jobs - gov_slow_last,
+			    gov_khz_sum[0] / n / 1000, gov_khz_sum[1] / n / 1000, gov_khz_sum[2] / n / 1000, gov_khz_sum[3] / n / 1000);
+			gov_boosts = gov_touches = gov_slow_raises = 0;
+			gov_slow_last = redwood_mali_slow_jobs;
 			gov_changes = 0;
 			for (unsigned g = 0; g < NGOV; g++) {
 				gov_khz_sum[g] = 0;
+			}
+		}
+		{
+			extern uint64_t redwood_user_cache_ops, redwood_user_cache_flushes;
+			static uint64_t last_ops, last_flushes;
+			uint64_t ops = redwood_user_cache_ops, flushes = redwood_user_cache_flushes;
+
+			extern uint64_t redwood_user_cache_small;
+			static uint64_t last_small;
+			uint64_t small = redwood_user_cache_small;
+
+			dlog("user cache maintenance done for user code (trapped, osfmk/arm64/sleh.c): %llu in 10 s, of them "
+			    "%llu whole sys_icache_invalidate ranges (every core's instruction cache; %llu line by line through "
+			    "the kernel's alias, the rest IC IALLU)", ops - last_ops, flushes - last_flushes, small - last_small);
+			last_small = small;
+			last_ops = ops;
+			last_flushes = flushes;
+		}
+		{
+			struct cpuidle_count { uint64_t entered, resumed, returned, refused, skipped, slept_abs; };
+			extern struct cpuidle_count redwood_cpuidle_counts[8];
+			static struct cpuidle_count last[8];
+			char line[512];
+			size_t at = 0;
+			uint64_t any = 0;
+
+			at += snprintf(line + at, sizeof(line) - at, "cpuidle 10 s, per core powered off (asleep ms) / came "
+			    "back at once / refused / too soon:");
+			for (unsigned c = 0; c < 8; c++) {
+				struct cpuidle_count *n = &redwood_cpuidle_counts[c], *l = &last[c];
+				uint64_t ns;
+
+				absolutetime_to_nanoseconds(n->slept_abs - l->slept_abs, &ns);
+				any |= n->entered - l->entered;
+				if (at >= sizeof(line)) {
+					break;
+				}
+				at += snprintf(line + at, sizeof(line) - at, " %u:%llu(%llu)/%llu/%llu/%llu", c, n->resumed - l->resumed,
+				    ns / NSEC_PER_MSEC, n->returned - l->returned, n->refused - l->refused, n->skipped - l->skipped);
+				*l = *n;
+			}
+			if (any) {
+				extern void redwood_wake_report(void);
+
+				dlog("%s", line);
+				redwood_wake_report();
+			}
+			{
+				extern uint32_t gic_resume_seen[][2];
+				static uint8_t told;
+
+				for (unsigned c = 0; c < 8; c++) {
+					if ((gic_resume_seen[c][0] & (1u << 31)) && !(told & (1u << c))) {
+						told |= 1u << c;
+						dlog("cpuidle: core %u's first wake: its GIC had GICC_CTLR %#x PMR %#x ISENABLER0 %#x "
+						    "(before they were set again)", c, (gic_resume_seen[c][0] >> 16) & 0x7fff,
+						    gic_resume_seen[c][0] & 0xffff, gic_resume_seen[c][1]);
+					}
+				}
 			}
 		}
 		report(hot ? "every 10 s (throttled)" : "every 10 s");

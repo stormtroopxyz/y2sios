@@ -45,6 +45,7 @@
 #include <sys/sysctl.h>
 #include <signal.h>
 #include <sys/ucontext.h>
+#include "m2m.h"
 #include <unistd.h>
 
 #include "redwood_gl.h"
@@ -289,6 +290,11 @@ say_the_fault(int signal_number, siginfo_t *info, void *context_in)
 				    where[i] - (uintptr_t)d.dli_fbase, d.dli_sname != NULL ? d.dli_sname : "?");
 			}
 		}
+	}
+	/* a Metal client's crash is mali2metal's evidence too (m2m.h): where it was, in the channel; the
+	 * kernel's own record ("F CRASH ... ended by signal") follows when the process is gone */
+	if (dlopen("/redwood/lib/RedwoodMetal.bundle/RedwoodMetal", RTLD_LAZY | RTLD_NOLOAD) != NULL) {
+		m2m_crash_record(signal_number, info, context_in);
 	}
 	signal(signal_number, SIG_DFL);
 	raise(signal_number);

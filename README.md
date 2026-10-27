@@ -2,34 +2,37 @@
 
 XNU 8796.121.2 and the iOS 16.5 user space on the Samsung Galaxy S20+ 5G (Exynos 990, SM-G986B, codename `y2s`).
 
-This repository is a source snapshot of a working research port. The current image starts from the phone's `recovery` partition, runs Mu-Silicium UEFI and the `xnuloader` EFI application, enters XNU at EL1, mounts an APFS root, and reaches SpringBoard. Display, GPU, touch, buttons, battery, UFS storage, Wi-Fi, Bluetooth transport and ACPM DVFS are implemented. Cellular, camera, audio output, Metal and Apple services are not.
+This repository is a source snapshot of a working research port. The current image starts from the phone's `recovery` partition, runs Mu-Silicium UEFI and the `xnuloader` EFI application, enters XNU at EL1, mounts an APFS root, and reaches the lock screen. Display, GPU, Metal (CoreAnimation renders through Metal on the Mali), touch, buttons, battery, UFS storage, Wi-Fi, Bluetooth transport, ACPM DVFS with a governor and thermal limits, and idle power-down of all eight cores are implemented. Cellular, camera, audio output, sensors and Apple services are not.
 
 The port is not a ROM and is not suitable as a daily driver. It is intended for hardware bring-up, driver development and research on recovered or spare hardware.
 
 ## Status
 
-Current as of 26 October 2026.
+Current as of 27 October 2026.
 
 | Area | State | Notes |
 |---|---|---|
-| Boot to SpringBoard | Working | Standalone boot from `recovery`; no Android or host computer required |
-| Display | Working | 1440x3200, tear control, hardware scaler, brightness, display power |
-| Touch | Working | Samsung `sec_ts`, multitouch, loader escape gesture |
-| Buttons and battery | Working | GPIO keys, MAX77705 gauge and charger state |
-| GPU | Working | Mali-G77 MP11 via a Panfrost UAPI driver and Mesa 25.0.7; OpenGL ES for CoreAnimation |
-| Wi-Fi | Working | BCM4375 over PCIe, firmware 18.41.117, WPA2, DHCP, IPv4 and IPv6, HTTPS |
-| Storage | Working | Native UFS driver, read-only root from `super`, HFS+ `/private/var` on `userdata` |
+| Boot | Working | Standalone boot from `recovery`; starts at the lock screen (`autounlock=0`); no Android or host computer required |
+| Display | Working | 1440x3200 at 60 Hz, tear control, hardware scaler, brightness, display power; vsync notifications to CoreAnimation; brightness capped when the SoC is hot |
+| Touch | Working | Samsung `sec_ts`, multitouch, loader escape gesture; polled every 2 ms while touched, 8 ms otherwise |
+| Buttons and battery | Working | GPIO keys; MAX77705 gauge; charger state follows the cable (verified 27 Oct) |
+| GPU | Working | Mali-G77 MP11 via a Panfrost UAPI driver and Mesa 25.0.7; clock governed by load and by slow jobs |
+| Metal | Working | CoreAnimation, SpringBoard, widgets (`chronod`), WebKit and `mediaserverd` run on Metal; the standard tour has 0 crashes and 0 GPU faults. Maps' 8 pipelines are refused |
+| CPU | Working | All 8 cores, including the Mongoose M5 pair (Safari's JIT fixed by a cache-maintenance trap); load governor, Samsung's thermal steps and touch booster values; idle cores powered down through PSCI |
+| Wi-Fi | Working | BCM4375 over PCIe, firmware 18.41.117, WPA2, DHCP, IPv4 and IPv6, HTTPS; signal, noise floor and security reported to iOS |
+| Storage | Working | Native UFS driver, read-only root from `super`, HFS+ `/private/var` on `userdata`; iOS reports 128 GB |
+| Clock | Working | Time kept across reboots (verified 27 Oct) |
+| Frame pacing | Partial | 74-80 % of animation frames reach the next 60 Hz refresh; slow-frame tails under investigation |
 | Bluetooth | Partial | HCI transport, patchram and kernel control; profiles and pairing untested |
 | Audio | Not working | ABOX and CS35L41 configured; RDMA3 consumes zero frames, output silent |
-| Metal | Parked | Pipelines build; CoreAnimation function constants arrive as zero |
 | 120 Hz | Not implemented | Requires an FHD mode set at 1080x2400 |
 | Cellular | Not planned | Shannon 5123 has no open firmware interface; iOS baseband stack targets other vendors |
 | Camera | Not implemented | No Exynos ISP or camera pipeline |
-| Haptics, sensors, GNSS | Not implemented | No drivers |
-| Apple services | Not possible | No Secure Enclave; FairPlay and Apple ID sign-in cannot work |
-| Sleep | Not implemented | Display power only; no SoC suspend or wake policy |
+| Haptics, sensors, GNSS | Not implemented | No drivers; the motion sensors sit behind Samsung's sensor hub |
+| Apple services, passcode | Not possible | No Secure Enclave; FairPlay, Apple ID sign-in and a passcode cannot work |
+| Weather | Not working | No weather data |
+| Sleep | Not implemented | Idle cores power down; no SoC suspend or wake policy |
 | Charging control | Not implemented | MAX77705 runs on bootloader defaults; driver is read-only |
-| M5 cores | Disabled | All eight boot; Safari WebContent crashes with the M5 cluster enabled |
 | WPA3 | Implemented, untested | Firmware supports SAE; `wifid` capability bit not identified |
 
 ## Target hardware
@@ -111,7 +114,7 @@ Two boot-chain constraints are fixed:
 | Build configuration | `BCM2837`, used as a generic ARM64 base |
 | Interrupt build flag | `GENERIC_GIC_V2_IRQ`, set by exporting `GIC_V2=1` |
 | Output | `mach.development.bcm2837`, copied to `out/mach.y2s` |
-| Size | About 16.63 MB in a 16.78 MB slot |
+| Size | About 16.68 MB in a 16.78 MB slot |
 
 `kernel/xnu/` is an overlay, not a complete XNU tree. `apply.sh` clones Apple's source and applies `redwood.patch` plus the files in `files/`. `export.sh` regenerates both from a working tree.
 
@@ -139,7 +142,17 @@ QEMU's GICv2 model is insufficient for validating the driver: it has no security
 
 `CNTFRQ_EL0` reads zero. Writing it from EL1 raises an illegal instruction exception because the register is writable only from EL2 or EL3. The loader does not write it. `timer_freq()` returns `CNTFRQ` when valid and 26 MHz otherwise, and the device tree publishes 26 MHz as `timebase-frequency`.
 
-PSCI is used over SMC. The MPIDR table is `{0, 1, 2, 3, 4, 5, 0x100, 0x101}`. The loader writes explicit CPU nodes, and the kernel scheduler marks the A55 cores as slow. The default `cpumask=0x3f` uses the four A55 cores and the two A76 cores. The M5 cluster is excluded because a run with `cpumask=0xff` crashed Safari's WebContent process on every page; the cause is unresolved.
+PSCI is used over SMC. The MPIDR table is `{0, 1, 2, 3, 4, 5, 0x100, 0x101}`. The loader writes explicit CPU nodes, and the kernel scheduler marks the A55 cores as slow. The standard command line uses all eight cores (`cpumask=0xff`).
+
+#### The M5 cores and JIT code
+
+With the M5 pair enabled, Safari's WebContent process crashed on every page with SIGILL and SIGSEGV. A kernel fault record (pc, lr, far, esr, instruction, CPU and MIDR of every user fault) showed stale JIT instructions. Apple's `sys_icache_invalidate` issues `IC IVAU` per line and never `DC CVAU`, all three core types report `CTR_EL0.IDC=0`, and an `IC IVAU` broadcast does not reach across the DynamIQ cluster and the M5 cluster.
+
+`jit_flush=1` clears `SCTLR_EL1.UCI` on every core 60 seconds after boot, so user cache maintenance traps to the kernel (`osfmk/arm64/sleh.c`). At `sys_icache_invalidate`'s `IC IVAU` the handler cleans the whole range to the point of unification, then a cross-call makes every core invalidate its own instruction cache (line by line up to 256 lines, otherwise `IC IALLU`), and the thread resumes after the loop. Arming the trap at boot reset the phone without a log; the delayed arm does not. Safari faults dropped from 38 a tour to 0.
+
+#### Idle power-down
+
+`cpuidle=1` replaces XNU's plain `WFI` with PSCI `CPU_SUSPEND` power state `0x10000`, the `c2` state in the device tree. The MCT local timer (`mct@10040000`, SPIs `32 + 0x1d6 + n`) is the wake source, because the architected timer is clock-source only on this SoC. The PMU's per-core sequences are taken from Samsung's flexpmu, the GICv2 CPU interface is restored on resume, and the loader provides a resume trampoline (`kernel_cpu_resume`) that finds the core by MPIDR. `powergate_latency` comes from the device tree, so short `delay()` calls spin instead of sleeping. At idle the A55 cores are about 99 % powered down and the big cores 60-75 %.
 
 The boot core is MPIDR 0, a Cortex-A55 (`MIDR 0x412FD050`).
 
@@ -149,7 +162,7 @@ The command line is stored in the XNUP payload and can be changed without rebuil
 
 | Argument | Effect |
 |---|---|
-| `cpumask=0x3f` | Four A55 and two A76 cores |
+| `cpumask=0xff` | All eight cores (`0x3f`: four A55 and two A76) |
 | `cpus=N` | Number of cores; do not combine with `cpumask` |
 | `touch_ts=1` | Probe and poll touch; `2` probe only, `4` reset the bus |
 | `bms=1` | MAX77705 battery and charger |
@@ -160,7 +173,19 @@ The command line is stored in the XNUP payload and can be changed without rebuil
 | `fb_scaler=1` | Zero-copy display scaler |
 | `fb_bl=1` | Brightness and display power through DSIM |
 | `fb_threads=N` | Helper threads for the copy path |
-| `dvfs=2` | ACPM DVFS |
+| `dvfs=2` | ACPM DVFS, governor and thermal steps |
+| `dvfs_cl2=2304000` | Top clock of the M5 cluster |
+| `dvfs_gov=0`, `dvfs_gov_gpu=0` | Pin the CPU or GPU clocks instead of governing them |
+| `dvfs_hot=C` | First thermal step at C degrees for every domain (default: Samsung's per-domain values) |
+| `fb_hot=C` | Cap brightness at 70 % from C degrees, 50 % from C + 6 (default 90; `0` disables) |
+| `jit_flush=1` | Trap user cache maintenance for JIT code (needed for the M5 cores) |
+| `cpuidle=1` | Power idle cores down through PSCI |
+| `metal=1`, `camtl=1` | Publish the Metal plug-in and let CoreAnimation use Metal |
+| `metal_profile=1`, `mediamtl=1` | Metal capability profile; Metal for `mediaserverd` |
+| `autounlock=0` | Start at the lock screen |
+| `touch_poll_us=N`, `touch_active_us=N` | Touch polling period idle (8000) and while touched (2000) |
+| `touch_lat=1` | Per-frame and touch timing lines for `tools/frame_split.py` |
+| `fb_swapwait=0`, `fb_beat=0`, `fb_irq=0` | Display presentation experiments (defaults 1) |
 | `perf=1` | Per-core clocks and boot timing |
 | `wifi_pcie=1..4` | PCIe look, link, DMA grants, full Wi-Fi |
 | `wifi_pcie_wait=N` | Seconds before PCIe initialisation |
@@ -173,7 +198,7 @@ The command line is stored in the XNUP payload and can be changed without rebuil
 | `var_hfs=1` | HFS+ on `userdata` as `/private/var` |
 | `debug=0x8` | XNU debug flags |
 
-A full working command line is in [Build and pack](#build-and-pack).
+The standard command line is `kernel/m2m.cmdline`; see [Build and pack](#build-and-pack).
 
 ## Subsystems
 
@@ -187,7 +212,11 @@ Three display paths are implemented in `kernel/xnu/files/iokit/Kernel/MiniIOMobi
 - **Zero-copy hardware scaling (`fb_scaler=1`).** IDMA channel 5 and DPP channel 5 are configured, and window 5 is pointed at channel 5 instead of S-Boot's channel 0. A Keys bicubic filter scales 1125x2436 to 1440x3200 in the display controller. The log reports frames taken by the controller, for example 46 controller frames and one processor frame in a five-second interval.
 - **CPU fallback.** Frames that cannot use the scaler are copied and scaled by the CPU, and the window returns to S-Boot's channel.
 
-The scaler uses physically contiguous IOSurfaces below 4 GB. The loader reserves a 64 MB display pool because XNU does not manage memory below 4 GB on this platform. Surfaces are mapped write-combined. Swap tickets make `present()` wait until the frame has been latched, and the vsync is scheduled 0.3 ms after the last latch.
+The scaler uses physically contiguous IOSurfaces below 4 GB. The loader reserves a 64 MB display pool because XNU does not manage memory below 4 GB on this platform. Surfaces are mapped write-combined. Swap tickets make `present()` wait until the frame has been latched; the wait ends on DECON's frame-start interrupt (`fb_irq=1`) rather than a 100 µs poll.
+
+The vsync is scheduled 0.3 ms after the last latch. CoreAnimation in iOS 16.5 asks for it only on the chips `0x7000` to `0x8004`; on the iPhone X's `0x8015` it runs its own timer (QuartzCore `0x188364614` and `0x188373218`). The window server's launch job sets `CA_FORCE_TIMER=1`, which despite its name selects `IOMobileFramebufferEnableVSyncNotifications` (selector 72 with the type-5 handler). The driver counts requests and notifications in its `fb_vsync:` line. Measured: following the vsync did not change the share of frames that reach the next refresh, which stays at 74-80 %.
+
+When the hottest temperature zone reaches 90 C, the backlight is held under 70 % of its brightness, and under 50 % from 96 C. The requested level comes back when the zone cools.
 
 Brightness uses AOR (the fraction of each frame for which the OLED emitters are held off) rather than DBV alone. The panel sequence is:
 
@@ -215,14 +244,19 @@ Not implemented: 120 Hz. The panel requires an FHD mode set at 1080x2400; the DC
 The GPU stack is:
 
 ```
-CoreAnimation
-  -> EAGL (libredwood-gl, userland/src/eagl.c)
-  -> OSMesa / Mesa 25.0.7 panfrost
+CoreAnimation, WebKit, MPS                 OpenGL ES clients
+  -> Metal (RedwoodMetal plug-in,           -> EAGL (libredwood-gl,
+     userland/src/redwoodmetal.m)              userland/src/eagl.c)
+  -> libredwoodair: AIR -> NIR              -> OSMesa
+     (kernel/tools/mesa/air)
+  -> Mesa 25.0.7 panfrost
   -> libdrm stand-in (tools/mesa/redwood-drm)
   -> IOKit RedwoodMali (Panfrost UAPI 1.3)
   -> kernel/xnu/files/bsd/dev/redwood_mali.c
   -> Mali-G77 MP11
 ```
+
+The standard boot line renders CoreAnimation with Metal; the OpenGL ES path remains for EAGL clients and tests.
 
 The kernel driver performs the power cycle and the DTZPC restore (`smc(0x82000410, 1, 0x18410204, 2)`), resets the GPU, applies G57 errata, builds four-level page tables, allocates virtual address space, and runs a FIFO job scheduler with fault and timeout recovery. The Mesa patch adds a G77 model row with a 32768-byte tilebuffer; 16384 bytes produces `DATA_INVALID_FAULT`.
 
@@ -235,9 +269,23 @@ Measured on hardware:
 | Full-screen textured and blended layer | About 1.1 ms at 1125x2436 |
 | Eight layers | About 5.5 ms |
 | SpringBoard compositing | GPU path active, job interrupt at GIC 333 |
-| GPU clock | 260 MHz at boot, 702 MHz after ACPM DVFS |
+| GPU clock | 156 to 702 MHz under the governor (260 MHz at boot) |
+| Standard tour, cold | 0 GPU faults; GPU 85-93 % idle; median frame on the GPU 0.5-2.5 ms |
 
-Metal is implemented but parked. `userland/src/redwoodmetal.m` and `tools/mesa/air` translate AIR to NIR and run it on Panfrost. Pipelines build and SpringBoard runs, but CoreAnimation's `fixed_frag_lph_cph` uber-shader is specialised by 58 function constants, and the translator supplies zero for each because the expected setters are not called. The log reports `0 values (tied)`. This causes square corners, missing fills, missing masked content and a Settings crash. The next step is to read `MTLFunctionConstantValuesInternal` or decode `serializedConstantDataForFunction:dataSize:errorMessage:`.
+#### Metal
+
+CoreAnimation renders through Metal on the Mali (`metal=1 camtl=1`). `userland/src/redwoodmetal.m` is the Metal driver (a `MTLDevice` plug-in published by the kernel's accelerator service), and `kernel/tools/mesa/air` translates Apple's AIR bitcode to NIR and runs it on Panfrost through `libredwoodair.dylib`. CoreAnimation's shaders come pre-specialised from `QuartzCore.framework/default.pipelinelib`; function constants are read from Metal's own storage.
+
+The fixes that made the desktop correct and stable:
+
+- A process-wide lock around all `rwa_*` entry points, because one Gallium context is shared by every thread of a process.
+- Per-attachment load actions, mip levels and layers, and a render area of the smallest attachment.
+- Texture views, `air.is_null_texture`, textures over a buffer's memory (an in-process prime export in the libdrm stand-in) for `chronod`'s widgets, and bicubic sampling served as linear.
+- One completion queue per command queue at `USER_INTERACTIVE` QoS, as Apple's `com.Metal.CompletionQueueDispatch`. Widgets had waited up to 5 seconds for a thread.
+- Asynchronous `-commit`; a GPU buffer-object cache that keeps buffers 30 seconds within a 64 MB budget (`kernel/tools/mesa/panfrost-retain.patch`, 90-100 % hit rate).
+- Constant buffers bound as the buffer itself at aligned offsets. Panfrost uploaded a user buffer whole at every draw, and that copy was 48 % of the window server's time on a still lock screen.
+
+The standard tour (`userland/m2m.tour`) runs with 0 crashes and 0 GPU faults. Open: Maps' 8 render pipelines are refused (a buffer in address space 0), and Metal's texture-layout query has no answer.
 
 ### Input, buttons and power
 
@@ -247,11 +295,13 @@ The controller is on HSI2C_15, but the driver bit-bangs I2C on `gpp5-6` (SCL) an
 
 `tsp_io` and `tsp_avdd` are LDO2 and LDO3 of an S2DOS05 at I2C 0x60 on `hsi2c_4` (`gpp1-0` and `gpp1-1`). The driver enables LDO2, waits 1 ms, enables LDO3, and waits 100 ms. Before the rails are enabled, the touch controller clamps the bus low, a ghost address appears to acknowledge, and reads return zero.
 
-The attention line is `gpa1-0`. The driver polls it and accesses the bus only when it is low. Five fingers held for 1.5 seconds, or volume down plus power for about 3 seconds, returns to the loader.
+The attention line is `gpa1-0`. The driver polls it and accesses the bus only when it is low: every 8 ms with no finger down, every 2 ms while a finger is down or events arrived in the last 100 ms. At 8 ms the controller's reports piled up between reads (1.45 events per read) and reached iOS with one timestamp, which is what iOS computes a swipe's velocity from. A 30-second line in the m2m channel reports reads, events, presses and controller resets; an attention line held low with nothing to read clears the event stack and then turns sensing on again. Five fingers held for 1.5 seconds, or volume down plus power for about 3 seconds, returns to the loader.
+
+The bit-banged I2C waits up to 25 ms by the clock while a slave stretches SCL. It used to count 1000 one-microsecond delays; once short delays spun for their real length, that became 1 ms, and the touch controller and the fuel gauge stopped answering.
 
 Keys are plain active-low GPIOs on the ALIVE pinctrl at `0x15850000`: volume up `gpa0-3`, volume down `gpa0-4`, power `gpa2-4`.
 
-The battery driver reads a MAX77705 fuel gauge at 0x36 and charger at 0x69 every 5 seconds over a shared bit-banged bus. It reports through `redwood_battery_report()` to the `RedwoodBattery` IOPMPowerSource service. It is read-only; charger configuration is left as `sboot` set it.
+The battery driver reads a MAX77705 fuel gauge at 0x36 and charger at 0x69 every 5 seconds over a shared bit-banged bus. It reports through `redwood_battery_report()` to the `RedwoodBattery` IOPMPowerSource service. A charger counts as present when `CHGIN_OK` is set and `CHGIN_DTLS` reads 3 (VBUS valid), or the same for the wireless input, as Samsung's `max77705_get_vbus_state()` reads it; every change is recorded with the raw registers. It is read-only; charger configuration is left as `sboot` set it.
 
 ### Storage
 
@@ -264,6 +314,8 @@ The battery driver reads a MAX77705 fuel gauge at 0x36 and charger at 0x69 every
 - The doorbell bit is not taken back while `IS.UTRCS` is set. The driver treats a slot as complete when the doorbell bit is clear or the OCS is no longer the invalid value, then clears `UTRCS` and the slot's `UTRLCNR` bit, and uses `UTRLCLR` only if needed. In the md5 validation run, 2715 slots were retired by the controller and 7843 by the acknowledgement; none were stuck.
 
 The kernel exposes 33 partitions as `/dev/ufs_NAME` and `/dev/rufs_NAME`. Reads are whitelisted. Writes are restricted to `userdata` through the write window in `redwood_ufs.c`. The iOS root is a read-only window of `super` at `0x184B00000`.
+
+iOS sizes the device from `disk0`: MobileGestalt's `NANDSize()` matches a service by `BSD Name` and reads `Size`. `iokit/Kernel/RedwoodStorage.cpp` publishes those two properties with the sum of the UFS logical units, and `TotalDiskCapacity` reads 127968215040 bytes. Without it the value was -1 and Settings showed the 2 GB system volume.
 
 `/private/var` is a case-sensitive journaled HFS+ file system on `userdata`, created on first boot from a 60 KB kit and mounted by init. The write path reads back and compares every 4 MB, and close sends `SYNCHRONIZE CACHE`. HFS+ is linked into the kernel rather than loaded as a kext, which contributes to the kernel size pressure.
 
@@ -312,6 +364,8 @@ Measured results:
 - Safari loaded `google.com` and `apple.com`; 44 MB received and 1.7 MB sent with no drops.
 - IPv4 DHCP and IPv6 addressing both work.
 
+After a join, the driver reads the network as the firmware has it (`WLC_GET_BSS_INFO`), refreshes the signal every 2 seconds while asked (`WLC_GET_RSSI`), and reads the noise floor (`WLC_GET_PHY_NOISE`). Apple80211's current-network, RSSI, NOISE and link answers carry signal, noise and SNR, as a Mac driver fills `asr_noise`. A network joined by name had reached iOS as 0 dBm on no channel with no RSN element, shown as one bar and unsecured.
+
 WPA3 is implemented but untested. `wifid` rejects a WPA3-only network unless the driver advertises a capability bit that has not yet been identified in IO80211.
 
 ### Bluetooth
@@ -341,7 +395,7 @@ snd: after 250437 us the DMA read 0 frames, the clock says 12020: following the 
 snd: 162304 frames from iOS, 200704 fed, 18618662 silent, 1 underruns; DMA at 0
 ```
 
-RDMA3 does not advance. Candidates are the route registers, SPUS and SIFS configuration, the UAIF2 frame clock, and the amplifier ASPRX path. The `snd:` log lines contain the register readbacks needed to diagnose it. The plan is in [docs/plans/08-audio.md](docs/plans/08-audio.md).
+RDMA3 does not advance. Opening the CMU_AUD gates and Q-channels (all were already open) and disabling the ABOX Q-channel for UAIF2's bit clock changed nothing. Candidates are the route registers, SPUS and SIFS configuration, the UAIF2 frame clock, the amplifier ASPRX path, and the possibility that RDMA needs the Calliope DSP's firmware to start it, as Samsung's driver does (`abox_core.c`, `abox_ipc.c`). The `snd:` log lines contain the register readbacks needed to diagnose it. While iOS is silent for 3 seconds the driver sleeps and switches the amplifiers off. The plan is in [docs/plans/08-audio.md](docs/plans/08-audio.md).
 
 ### Clocks and power
 
@@ -355,7 +409,16 @@ dvfs: domain 2 to 1742000 kHz: answered
 dvfs: domain 3 to 2210000 kHz: answered
 ```
 
-The A55 cluster reaches 1.742 GHz, the A76 cluster 2.21 GHz, and the GPU 702 MHz. Temperatures under light load are around 60 C. The M5 cluster is a separate domain and remains unused. There is no thermal throttling policy beyond the firmware's own behaviour; `redwood_perf.c` and `thermald.c` provide measurement only.
+The A55 cluster reaches 1.742 GHz, the A76 cluster 2.21 GHz, the M5 cluster 2.304 GHz and the GPU 702 MHz.
+
+A governor in the same driver runs every 200 ms:
+
+- **CPU clusters.** Each cluster's busiest core decides: over 70 % busy takes the top rung at once; otherwise the rung that leaves it about 60 % busy, stepping down one rung after 0.6 s.
+- **GPU.** Its busy time is taken from the job interrupt (`redwood_mali_busy_pct`), aiming at 40 % busy and jumping to the top at 60 %, over Samsung's table of 156 to 702 MHz. A GPU job longer than 8 ms wakes the governor and takes the GPU to the top at once.
+- **Touch.** Samsung's input booster values for this phone (device tree `input_booster`, `touch`: 130 ms head, 500 ms tail) set clock floors the moment a finger lands. The GPU is held at 572 MHz for a touch; that value is this port's own.
+- **Thermal.** Samsung's steps (`exynos9830.dts` thermal zones): A55 86/96 C by the LITTLE zone, A76 86/96 C by MID, GPU 88/100 C by G3D, each released 6 degrees lower.
+
+The GPU had been pinned at 702 MHz and the SoC idled at 81-82 C. With the governor, idle power-down and fewer polling wake-ups (sound, Bluetooth, Wi-Fi and the display's latch waits), idle is 71-78 C and a cold standard tour runs at 65-80 C. The phone is already at about 90 C when `sboot` hands over while charging. `redwood_perf.c` and `thermald.c` provide measurement.
 
 ### Standalone operation
 
@@ -365,23 +428,40 @@ Log access starts a USB device stack on `EFI_USBFN_IO_PROTOCOL` and a fastboot s
 
 While iOS runs, `com.redwood.logd` serves the kernel log ring and message buffer over HTTP on port 8080, advertised by Bonjour as `HackiOS`. `y2s.sh wlog` and `wtail` use it.
 
+### mali2metal: the evidence loop
+
+Metal and the drivers around it are developed in a loop where every change is measured by a run.
+
+- **The m2m channel.** `bsd/dev/redwood_m2m.c` keeps a ring of records, `<seq> <seconds> <severity> <CATEGORY> <process>[<pid>] <message>`. User space writes to `/dev/m2m` (`userland/src/m2m.h`); the kernel adds GPU faults, client crashes and suspensions, CPU idle and wake reports, DVFS and thermal steps, touch and battery state. `sysctl kern.m2m_log` reads it.
+- **rwlogd** serves `GET /m2m`, `GET /tour` (runs `userland/m2m.tour`, a fixed set of gestures through `rwtouch`), `GET /notify?name=com.redwood.metal.*` and `GET /menu?to=1|3` (hand the phone back to Log access or Download Mode), besides the logs.
+- **`./y2s.sh loop LABEL`** builds the payload from `kernel/m2m.cmdline`, asks the running phone for Log access, flashes over USB, restarts, waits for iOS on Wi-Fi, runs the tour and saves the channel. It then reports the run against the previous one (`kernel/tools/m2m.py`). `M2M_SET="key=value ..."` varies the command line for one run; `M2M_PROF=1` adds the window server's sampling profiler.
+- **Analysis tools.**
+  - `tools/frame_split.py`: per-frame timing from `touch_lat=1`.
+  - `tools/prof-symbolize.py`, `tools/prof-stacks.py`: profiles. The profiler runs in any Metal process through `com.redwood.metal.prof.<process>`.
+  - `tools/dsc.py`, `dsc_xref.py`, `dsc_exports.py`, `dsc_cacheops.py`: disassemble and cross-reference the iOS 16.5 shared cache.
+
+The run log, with every measurement and what it ruled out, is [docs/plans/10-mali2metal.md](docs/plans/10-mali2metal.md).
+
 ## Known limitations
 
 | Limitation | Cause | Next step |
 |---|---|---|
-| No audio output | RDMA3 consumes zero frames | Inspect SPUS/SIFS/UAIF2 and amplifier ASPRX |
-| Metal rendering incorrect | 58 function constants supplied as zero | Read `MTLFunctionConstantValuesInternal` or decode serialized constants |
-| M5 cluster unstable | Unknown; WebContent crashes with `cpumask=0xff` | Compare per-core registers and cache/voltage configuration |
+| No audio output | RDMA3 consumes zero frames | Follow Samsung's DSP start-up (`abox_core.c`), or the exact RDMA enable sequence |
+| Animation frames miss refreshes | 20-25 % of frames are late; heat, GPU clock, vsync source and the presenter's beat are ruled out | Measure the late frames: window server time (p90 7-16 ms), GPU tails (p90 8 ms), render passes that load their attachments |
+| Maps does not draw | 8 render pipelines refused: a buffer in address space 0 | Translator support for that case |
 | No 120 Hz | Requires FHD mode set | Implement the documented DCS and DECON mode change |
 | No camera | No Exynos ISP or camera pipeline | New subsystem; upstream driver is Qualcomm-specific |
 | No cellular | Shannon 5123 firmware interface is undocumented; iOS baseband stack targets other vendors | Not planned |
-| No Apple services | No Secure Enclave or FairPlay | Hardware limitation |
+| No Apple services or passcode | No Secure Enclave or FairPlay | Hardware limitation |
 | No sleep | No SoC suspend or wake-source policy | Design and implement platform sleep |
 | No charging control | MAX77705 is read-only in this port | Add a reviewed charger policy |
-| No haptics, sensors or GNSS | Drivers not written | CS40L25, grip sensor and BCM4773 bring-up |
+| No haptics, sensors or GNSS | Drivers not written; sensors are behind Samsung's sensor hub | Sensor hub protocol from `drivers/sensorhub`; CS40L25; BCM4773 |
+| Touch momentum | Samples were batched with one timestamp at 8 ms polling | Measure with 2 ms polling; the attention line as an interrupt |
+| Brightness not kept across boots | Not measured yet | Set before a reboot and read CoreBrightness's request |
+| No weather data | Not investigated | |
 | Bluetooth profiles untested | HCI and control transport only | Pairing and profile work |
 | WPA3 untested | `wifid` capability bit unknown | Identify the IO80211 capability |
-| Kernel size pressure | 16.63 MB of 16.78 MB used | Move `root.apfs` or reduce linked subsystems |
+| Kernel size pressure | 16.68 MB of 16.78 MB used | Move `root.apfs` or reduce linked subsystems |
 | WPA2 supplicant in kernel | Samsung firmware lacks `idsup` | Keep in kernel or move to user space |
 
 ## Build
@@ -412,12 +492,12 @@ rsync -a "$SNAP/kernel/xnuloader/" xnuloader/
 rsync -a "$SNAP/kernel/common/" common/
 rsync -a "$SNAP/kernel/tools/" tools/
 rsync -a "$SNAP/userland/src/" userland/src/
-cp "$SNAP/kernel/y2s.sh" .
+cp "$SNAP/kernel/y2s.sh" "$SNAP/kernel/m2m.cmdline" .
 cp "$SNAP/userland/build-gpu-y2s.sh" "$SNAP/userland/build.sh" \
    "$SNAP/userland/mkjobs.py" "$SNAP/userland/mkeagl.py" userland/
 cp "$SNAP/userland"/rc.* userland/
 cp "$SNAP/userland"/*.plist userland/
-cp "$SNAP/userland/hfs-kit.bin" userland/
+cp "$SNAP/userland/hfs-kit.bin" "$SNAP/userland/m2m.tour" userland/
 rsync -a "$SNAP/userland/libmini/" userland/libmini/
 
 xnu/apply.sh
@@ -455,8 +535,10 @@ Output: `Build/y2sPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd`, 2 MiB.
 ```sh
 cd userland
 ../ios165/fetch.sh
-RC_JOBS=rc.jobs.y2s ./build-gpu-y2s.sh
+QUIET=1 RC=rc.launchd.metal RC_JOBS=rc.jobs.manual ./build-gpu-y2s.sh
 ```
+
+`RC=rc.launchd.metal` starts the Metal plug-in setup (`metal_props`) before the window server; without it CoreAnimation falls back to OpenGL ES. `RC_JOBS=rc.jobs.y2s` builds the older scripted demonstration instead of leaving the phone to the user.
 
 `build-gpu-y2s.sh` builds Mesa with panfrost, the EAGL library, the Metal libraries and tests, then calls `build.sh` with `GL=1`. `build.sh` produces `root.apfs` and the 2.3 GB `system.apfs`. Apple files and the system image are not committed.
 
@@ -465,12 +547,20 @@ RC_JOBS=rc.jobs.y2s ./build-gpu-y2s.sh
 From the kernel tree:
 
 ```sh
-./y2s.sh payload "touch_ts=1 bms=1 mali=1 cpumask=0x3f fb_threads=6 \
-  fb_te=1 fb_bl=1 fb_scaler=1 dvfs=2 perf=1 mali_irq=1 mali_cached=1 \
-  wifi_pcie=4 wifi_pcie_wait=3 ufs=2 ufs_native=1 \
-  ufs_root=super:184b00000:948c0000 ufs_write=1 var_hfs=1 bt=1 snd=1"
+./y2s.sh payload "$(cat m2m.cmdline)"
 ./y2s.sh pack
 ```
+
+`m2m.cmdline` is the standard command line:
+
+```
+touch_ts=1 bms=1 mali=1 cpumask=0xff fb_threads=6 fb_te=1 fb_bl=1 fb_scaler=1 metal=1 camtl=1
+metal_profile=1 mediamtl=1 dvfs=2 perf=1 perf_secs=30 mali_irq=1 mali_cached=1 wifi_pcie=4
+wifi_pcie_wait=3 ufs=2 ufs_native=1 ufs_root=super:184b00000:948c0000 ufs_write=1 var_hfs=1 bt=1
+snd=1 dvfs_cl2=2304000 jit_flush=1 cpuidle=1 autounlock=0
+```
+
+`./y2s.sh loop LABEL` does payload, pack, flash, boot, tour and report in one step when iOS is already running on Wi-Fi.
 
 `payload` builds the loader and XNUP container and records the size of `root.apfs`. `pack` writes `out/y2s-recovery.img` as:
 
@@ -519,6 +609,7 @@ Useful hardware techniques:
 - **Write-back test.** Write a value to a register and read it back. A value that does not stick indicates a gated clock or unpowered block.
 - **Ghost I2C address.** Access an unassigned address. An acknowledgement indicates a stuck-low data line, not a working bus.
 - **Deliberate panic.** A panic message is the last entry in the log and survives to storage. Include register values in the message.
+- **The m2m channel and the loop.** See [mali2metal](#mali2metal-the-evidence-loop). `./y2s.sh m2m report RUN` compares two runs record by record.
 - **Instrument checks.** [docs/history/checks.md](docs/history/checks.md) documents measurement failures from this port, including skipped cases counted as successes and stale build artefacts.
 
 ## Repository layout
@@ -530,7 +621,7 @@ y2sios/
   NOTICE.md
   docs/
     history/                 port log, handoff, GICv2, touch, macOS notes
-    plans/                   display, GPU, wireless, audio, standalone plans
+    plans/                   display, GPU, Metal, wireless, audio, standalone plans
     research/                ABOX, DPU, Wi-Fi and Bluetooth reports
     architecture.md
     building.md
@@ -539,10 +630,12 @@ y2sios/
     xnu/                     redwood.patch, files/, apply.sh, export.sh
     xnuloader/               EFI loader source
     common/                  build profiles including y2s.conf
-    tools/                   Mesa, brcmfmac, APFS, HFS and diagnostic tools
-    y2s.sh                   build, pack, flash and log commands
+    tools/                   Mesa, brcmfmac, APFS, HFS, m2m, profiler and shared-cache tools
+    y2s.sh                   build, pack, flash, log and loop commands
+    m2m.cmdline              the standard boot command line
   userland/
-    src/                     iOS-side programs and injected libraries
+    src/                     iOS-side programs, injected libraries, Metal driver
+    m2m.tour                 the standard tour of gestures
     build.sh                 root.apfs and system.apfs
     build-gpu-y2s.sh         Mesa, EAGL and Metal build on macOS
   uefi/
@@ -570,6 +663,7 @@ Not included: `xnu-src`, `ios165`, `prebuilt`, `fw-stock`, `samloader`, `backup-
 - [docs/plans/06-wireless.md](docs/plans/06-wireless.md): Wi-Fi, WPA2 and Bluetooth.
 - [docs/plans/08-audio.md](docs/plans/08-audio.md): ABOX and amplifier plan.
 - [docs/plans/09-standalone.md](docs/plans/09-standalone.md): boot menu, USB flashing, UFS root, HFS+ `/var`.
+- [docs/plans/10-mali2metal.md](docs/plans/10-mali2metal.md): the m2m channel, the loop, and the run log for Metal, power, thermals and frame pacing.
 
 The history and plan files are working notes. They contain superseded statements and should not be read as current status.
 

@@ -248,7 +248,21 @@ for entry in filter(None, os.environ.get('JOB_ENV', '').split(';')):
     job_env[who.strip()] = dict(p.split('=', 1) for p in pairs.split(',') if '=' in p)
 
 
+# Variables a job always gets.
+# CA_FORCE_TIMER=1 for the window server: CoreAnimation (iOS 16.5 QuartzCore 0x188364614) follows the
+# display's refresh notifications (IOMobileFramebufferEnableVSyncNotifications, selector 72 here, the
+# kernel's vsync just after each frame is latched) only on the chips 0x7000-0x8004 or with this variable
+# set; on the iPhone X's 0x8015 it ran its own timer, out of phase with the panel (27 October: 0 vsync
+# requests, 30 % of animation frames 25 ms apart). Despite its name the variable selects the notifications
+# (0x188373218: bit 1 of the display's flags -> EnableVSyncNotifications).
+JOB_FIXED_ENV = {
+    'com.apple.backboardd': {'CA_FORCE_TIMER': '1'},
+}
+
+
 def apply_job_env(label, job):
+    if label in JOB_FIXED_ENV and os.environ.get('CA_VSYNC', '1') != '0':
+        job.setdefault('EnvironmentVariables', {}).update(JOB_FIXED_ENV[label])
     if label in job_env:
         job.setdefault('EnvironmentVariables', {}).update(job_env[label])
         job['StandardErrorPath'] = '/dev/console'

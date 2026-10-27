@@ -38,7 +38,11 @@
  *                    2 power-cycle them first (forces a fresh controller boot)
  *   touch_attn=0     ignore the attention pin and read the event stack every poll
  *   touch_pullup=1   also enable the SoC's internal pull-ups on the bus pins
- *   touch_poll_us=N  how often the attention pin is looked at (default 8000 us)
+ *   touch_poll_us=N  how often the attention pin is looked at with no finger down (default 8000 us)
+ *   touch_active_us=N  ... and while a finger is down or events are coming (default 2000 us). At 8 ms the
+ *                    controller's reports piled up between looks (27 October: 1.45 events a read), were
+ *                    posted together with one timestamp, and iOS's velocity of a swipe -- flicks, momentum
+ *                    -- is computed from those timestamps
  *   touch_flip=N     bit 0 mirrors X, bit 1 mirrors Y
  *   touch_trace=1    print every raw event
  */
@@ -51,6 +55,7 @@
 #include <stdarg.h>
 #include <sys/redwood_bbi2c.h>
 #include <sys/redwood_input.h>
+#include <sys/redwood_m2m.h>
 #include <sys/systm.h>
 
 /* ------------------------------------------------------------------------ */
@@ -85,6 +90,7 @@ note(const char *format, ...)
 	vsnprintf(line, sizeof(line), format, ap);
 	va_end(ap);
 	printf("sec_ts: %s\n", line);
+	m2m_klog('I', "DEV", "sec_ts: %s", line);
 
 	used = strlen(summary);
 	if (used + 4 < sizeof(summary)) {
@@ -272,6 +278,9 @@ static struct {
 	uint32_t x, y;
 } finger[TS_MAX_FINGERS];
 
+/* for the touch line in mali2metal's channel (sec_ts_thread): whether the controller is still heard */
+static uint32_t note_resets, note_presses, note_failed_reads;
+
 static bool
 ts_read(uint8_t cmd, uint8_t *buf, uint32_t len)
 {
@@ -350,11 +359,12 @@ handle_event(const uint8_t *e)
 	if (eid == TS_EID_STATUS) {
 		/* a watchdog reset: the controller rebooted and must be told to sense again */
 		if (kind == TS_STYPE_INFO && e[1] == TS_ACK_BOOT_COMPLETE && e[2] == 0x20) {
-			printf("sec_ts: the controller reset itself, sensing again\n");
+			note_resets++;
+			m2m_klog('W', "DEV", "sec_ts: the controller reset itself, sensing again");
 			release_all();
 			ts_start_sensing();
 		} else if (kind == TS_STYPE_ERR) {
-			printf("sec_ts: error status %02x %02x %02x %02x\n", e[1], e[2], e[3], e[4]);
+			m2m_klog('W', "DEV", "sec_ts: error status %02x %02x %02x %02x", e[1], e[2], e[3], e[4]);
 			release_all();
 		}
 		return;
@@ -383,6 +393,7 @@ handle_event(const uint8_t *e)
 			finger[slot].down = true;
 			finger[slot].x = x;
 			finger[slot].y = y;
+			note_presses++;
 			redwood_touch_post(REDWOOD_TOUCH_DOWN, slot, x, y);
 		} else if (finger[slot].x != x || finger[slot].y != y) {
 			finger[slot].x = x;
@@ -409,7 +420,11 @@ read_events(void)
 	uint8_t first[TS_EVENT_SIZE];
 	uint32_t left, i;
 
-	if (!ts_read(TS_READ_ONE_EVENT, first, sizeof(first)) || first[0] == 0) {
+	if (!ts_read(TS_READ_ONE_EVENT, first, sizeof(first))) {
+		note_failed_reads++;
+		return 0;
+	}
+	if (first[0] == 0) {
 		return 0;
 	}
 	if ((first[0] & 0x3) == TS_EID_EMPTY) {
@@ -471,9 +486,9 @@ ts_probe(void)
 	ok = ts_read(TS_READ_ID, id, sizeof(id)) && ok;
 	ok = ts_read(TS_READ_FW_VERSION, fw, sizeof(fw)) && ok;
 	ok = ts_read(TS_READ_PANEL_INFO, panel, sizeof(panel)) && ok;
-	note("%s: dev %02x%02x%02x%02x%02x id %02x%02x%02x fw %02x.%02x.%02x.%02x integrity %#x boot %#x status %02x %02x %02x %02x",
-	    ok ? "answers" : "NO ANSWER", devid[0], devid[1], devid[2], devid[3], devid[4], id[0], id[1], id[2],
-	    fw[0], fw[1], fw[2], fw[3], integrity, boot, status[0], status[1], status[2], status[3]);
+	note("%s: dev %02x%02x%02x%02x%02x id %02x%02x%02x fw %02x.%02x.%02x.%02x integrity %#x boot %#x status %02x %02x %02x %02x; "
+	    "%u stretched clocks given up on so far", ok ? "answers" : "NO ANSWER", devid[0], devid[1], devid[2], devid[3], devid[4], id[0], id[1], id[2],
+	    fw[0], fw[1], fw[2], fw[3], integrity, boot, status[0], status[1], status[2], status[3], ts_bus.stretch_timeouts);
 	if (!ok) {
 		return false;
 	}
@@ -501,7 +516,7 @@ ts_probe(void)
 static void
 sec_ts_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	uint32_t poll_us = 8000, mode = 0, pwr = 1, pullup = 0;
+	uint32_t poll_us = 8000, active_us = 2000, mode = 0, pwr = 1, pullup = 0;
 	uint64_t reads = 0, events = 0;
 
 	PE_parse_boot_argn("touch_ts", &mode, sizeof(mode));
@@ -509,6 +524,10 @@ sec_ts_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("touch_attn", &use_attn, sizeof(use_attn));
 	PE_parse_boot_argn("touch_pullup", &pullup, sizeof(pullup));
 	PE_parse_boot_argn("touch_poll_us", &poll_us, sizeof(poll_us));
+	PE_parse_boot_argn("touch_active_us", &active_us, sizeof(active_us));
+	if (active_us < 500 || active_us > poll_us) {
+		active_us = poll_us;
+	}
 	if (poll_us < 1000 || poll_us > 100000) {
 		poll_us = 8000;
 	}
@@ -542,7 +561,7 @@ sec_ts_thread(__unused void *parameter, __unused wait_result_t result)
 		if (failed == NULL) {
 			break;
 		}
-		printf("sec_ts: attempt %u: %s\n", attempt, failed);
+		m2m_klog('W', "DEV", "sec_ts: attempt %u: %s", attempt, failed);
 		summary[0] = 0;
 		sleep_us(200000);
 	}
@@ -550,7 +569,7 @@ sec_ts_thread(__unused void *parameter, __unused wait_result_t result)
 		if (mode == 2) {
 			panic("sec_ts: %s: %s", failed, summary);
 		}
-		printf("sec_ts: %s after 5 attempts: no touch screen this run\n", failed);
+		m2m_klog('E', "DEV", "sec_ts: %s after 5 attempts: no touch screen this run", failed);
 		return;
 	}
 	if (mode == 2) {
@@ -559,21 +578,74 @@ sec_ts_thread(__unused void *parameter, __unused wait_result_t result)
 	if (mode == 3) {
 		return;
 	}
-	printf("sec_ts: polling every %u us (%s)\n", poll_us,
+	m2m_klog('I', "DEV", "sec_ts: polling every %u us, %u us while touched (%s)", poll_us, active_us,
 	    use_attn ? "when the attention line is low" : "always");
 
+	/*
+	 * Every 30 s a line in mali2metal's channel: whether the controller is still heard (reads,
+	 * events, presses), and how often its attention line was low. A line held
+	 * low with nothing to read is a controller that has stopped: its event stack is cleared, and
+	 * if that does not let the line go, it is told to sense again (as after its own reset).
+	 */
+	uint64_t period_abs, report_at, looks = 0, low = 0, stuck = 0, last_reads = 0, last_events = 0, active_until = 0;
+	uint64_t active_abs;
+	uint32_t last_presses = 0, last_failed = 0, last_resets = 0;
+
+	nanoseconds_to_absolutetime(30ULL * NSEC_PER_SEC, &period_abs);
+	nanoseconds_to_absolutetime(100ULL * NSEC_PER_MSEC, &active_abs);
+	report_at = mach_absolute_time() + period_abs;
 	for (;;) {
+		looks++;
 		if (attn_pending()) {
 			uint32_t n = read_events();
 
+			low++;
 			reads++;
 			events += n;
+			if (n != 0) {
+				active_until = mach_absolute_time() + active_abs;
+			}
+			stuck = n == 0 ? stuck + 1 : 0;
+			if (stuck == 1000000 / poll_us) {
+				m2m_klog('W', "DEV", "sec_ts: attention held low for 1 s with nothing to read (%u failed reads): "
+				    "clearing the event stack", note_failed_reads);
+				ts_write(TS_CMD_CLEAR_EVENT_STACK, NULL, 0);
+				release_all();
+			} else if (stuck == 5000000 / poll_us) {
+				m2m_klog('W', "DEV", "sec_ts: attention still held low after 5 s: sensing on again -> %d",
+				    ts_start_sensing());
+				stuck = 0;
+			}
 			if (touch_trace && (reads % 500) == 0) {
 				printf("sec_ts: %llu reads, %llu events, %u stretch timeouts\n",
 				    reads, events, ts_bus.stretch_timeouts);
 			}
 		}
-		sleep_us(poll_us);
+		if (mach_absolute_time() >= report_at) {
+			{
+				m2m_klog('I', "DEV", "sec_ts: 30 s: %llu reads (%u failed), %llu events, %u presses, %u controller "
+				    "resets; attention low %llu of %llu looks, now %s; %u bus stretch timeouts", reads - last_reads,
+				    note_failed_reads - last_failed, events - last_events, note_presses - last_presses,
+				    note_resets - last_resets, low, looks, attn_pending() ? "low" : "high",
+				    ts_bus.stretch_timeouts);
+			}
+			last_reads = reads;
+			last_events = events;
+			last_presses = note_presses;
+			last_failed = note_failed_reads;
+			last_resets = note_resets;
+			looks = low = 0;
+			report_at = mach_absolute_time() + period_abs;
+		}
+		/* quick while a finger is down or events came in the last 100 ms */
+		{
+			bool touched = mach_absolute_time() < active_until;
+
+			for (unsigned i = 0; !touched && i < TS_MAX_FINGERS; i++) {
+				touched = finger[i].down;
+			}
+			sleep_us(touched ? active_us : poll_us);
+		}
 	}
 }
 

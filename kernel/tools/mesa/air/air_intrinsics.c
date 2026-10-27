@@ -1267,6 +1267,8 @@ parse_tex_name(const char *name, struct air_tex_name *t)
       t->op = "write";
    } else if (eat(&s, "calculate_clamped_lod_") || eat(&s, "calculate_unclamped_lod_")) {
       t->op = "lod";
+   } else if (eat(&s, "is_null_")) {
+      t->op = "is_null";
    } else if (eat(&s, "get_")) {
       t->op = "get";
       static const char *queries[] = {
@@ -1547,6 +1549,48 @@ tex_coord_and_layer(struct air_ctx *c, const struct air_inst *in,
    return coord;
 }
 
+/*
+ * air.is_null_texture_* / air.is_null_depth_*: whether a texture is bound at the slot,
+ * which only the runtime knows. Answered from a word the runtime fills per draw or
+ * dispatch (air_shader_info.null_query_ubo, one bit per bound slot) at a constant-buffer
+ * index this shader's own `constant` arguments leave free. Below 15, because Panfrost has
+ * 16 constant buffers and appends its own after the shader's.
+ */
+static bool
+null_texture_query(struct air_ctx *c, const struct air_inst *in, const struct air_name *n,
+                   const struct air_ptr *tex)
+{
+   if (tex->binding >= 32)
+      return air_error(c, "intrinsic: air.%s on texture %u (the bound-slot word has 32 bits)",
+                       n->part[0], tex->binding);
+   if (!c->info->null_query_ubo) {
+      uint32_t used = 0;
+      for (unsigned i = 0; i < c->info->num_resources; i++) {
+         const struct air_resource *r = &c->info->resources[i];
+         if (r->kind == AIR_RESOURCE_CONSTANT_BUFFER && r->index < 32)
+            used |= 1u << r->index;
+      }
+      unsigned free_index = 0;
+      while (free_index < 15 && (used & (1u << free_index)))
+         free_index++;
+      if (free_index == 15)
+         return air_error(c, "intrinsic: air.%s, and constant buffers 0-14 are all the "
+                             "shader's own: there is no index left for the bound-slot word",
+                          n->part[0]);
+      c->info->null_query_ubo = free_index + 1;
+   }
+   c->info->null_query_textures |= 1u << tex->binding;
+
+   nir_def *word = nir_load_ubo(&c->b, 1, 32, nir_imm_int(&c->b, c->info->null_query_ubo - 1),
+                                nir_imm_int(&c->b, 0), .align_mul = 4, .align_offset = 0,
+                                .range_base = 0, .range = 4);
+   nir_def *bound = nir_iand_imm(&c->b, nir_ushr_imm(&c->b, word, tex->binding), 1);
+   nir_def *is_null = nir_ieq_imm(&c->b, bound, 0);
+   unsigned bits = air_nir_bit_size(c, in->base.type);
+   air_set(c, &in->base, air_val_ssa(c, bits == 1 ? is_null : nir_b2iN(&c->b, is_null, bits)));
+   return true;
+}
+
 static bool
 texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n)
 {
@@ -1581,6 +1625,9 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
    struct air_ptr tex;
    if (!tex_handle(c, in, 1, AIR_PTR_TEXTURE, &tex))
       return false;
+
+   if (!strcmp(t.op, "is_null"))
+      return null_texture_query(c, in, n, &tex);
 
    unsigned arg = 2;   /* operands[0] is the callee, [1] the texture */
    struct air_ptr samp = { 0 };

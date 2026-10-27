@@ -29,6 +29,7 @@
 #include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -171,6 +172,10 @@ static const uint16_t ring_item_len_pre7[RINGS] = { 40, 32, 24, 16, 32 };
 #define WLC_GET_BSSID           23
 #define WLC_SET_SSID            26
 #define WLC_DISASSOC            52
+#define WLC_GET_RSSI            127             /* BRCMF_C_GET_RSSI: brcmf_scb_val_le, the val is dBm */
+#define WLC_GET_PHY_NOISE       135             /* BRCMF_C_GET_PHY_NOISE: an int, dBm */
+#define WLC_GET_BSS_INFO        136             /* BRCMF_C_GET_BSS_INFO: a length word, then one brcmf_bss_info_le */
+#define BSS_INFO_MAX            2048            /* WL_BSS_INFO_MAX */
 #define WLC_GET_VAR             262
 #define WLC_SET_VAR             263
 #define WLC_SET_WSEC_PMK        268
@@ -973,10 +978,36 @@ mhz_chanspec(uint16_t mhz)
  * ie_offset 116, ie_length 120. Kept with its information elements (Apple80211 reads the network's
  * protection out of them).
  */
+/* One brcmf_bss_info_le into what Apple80211 is told of a network; false if it is too short to be one. */
+static bool
+bss_fill(struct redwood_sta_bss *b, const uint8_t *bi, uint32_t avail)
+{
+	uint32_t length = le32(bi + 4), ie_offset, ie_length;
+
+	if (length < 126 || length > avail) {
+		return false;
+	}
+	bzero(b, __builtin_offsetof(struct redwood_sta_bss, elements));
+	memcpy(b->bssid, bi + 8, 6);
+	b->beacon_interval = le16(bi + 14);
+	b->capability = le16(bi + 16);
+	b->ssid_length = bi[18] > 32 ? 32 : bi[18];
+	memcpy(b->ssid, bi + 19, b->ssid_length);
+	b->rssi = (int16_t)le16(bi + 78);
+	b->frequency = chan_mhz(bi[88] != 0 ? bi[88] : (uint8_t)(le16(bi + 72) & 0xff), le16(bi + 72));
+	ie_offset = le16(bi + 116);
+	ie_length = le32(bi + 120);
+	if (ie_offset >= 126 && ie_offset <= length && ie_length <= length - ie_offset) {
+		b->elements_length = (uint16_t)(ie_length > REDWOOD_STA_ELEMENTS_MOST ? REDWOOD_STA_ELEMENTS_MOST : ie_length);
+		memcpy(b->elements, bi + ie_offset, b->elements_length);
+	}
+	return true;
+}
+
 static void
 heard_one(const uint8_t *bi, uint32_t avail)
 {
-	uint32_t length = le32(bi + 4), ie_offset, ie_length;
+	uint32_t length = le32(bi + 4);
 	struct redwood_sta_bss *b = NULL;
 	int16_t rssi;
 
@@ -999,20 +1030,7 @@ heard_one(const uint8_t *bi, uint32_t avail)
 		}
 		b = &found[nfound++];
 	}
-	bzero(b, __builtin_offsetof(struct redwood_sta_bss, elements));
-	memcpy(b->bssid, bi + 8, 6);
-	b->beacon_interval = le16(bi + 14);
-	b->capability = le16(bi + 16);
-	b->ssid_length = bi[18] > 32 ? 32 : bi[18];
-	memcpy(b->ssid, bi + 19, b->ssid_length);
-	b->rssi = rssi;
-	b->frequency = chan_mhz(bi[88] != 0 ? bi[88] : (uint8_t)(le16(bi + 72) & 0xff), le16(bi + 72));
-	ie_offset = le16(bi + 116);
-	ie_length = le32(bi + 120);
-	if (ie_offset >= 126 && ie_offset <= length && ie_length <= length - ie_offset) {
-		b->elements_length = (uint16_t)(ie_length > REDWOOD_STA_ELEMENTS_MOST ? REDWOOD_STA_ELEMENTS_MOST : ie_length);
-		memcpy(b->elements, bi + ie_offset, b->elements_length);
-	}
+	bss_fill(b, bi, avail);
 }
 
 /* brcmf_fweh_process_event(): an Ethernet frame of type 0x886c, Broadcom's event header (big-endian) [fweh]215..248 */
@@ -2132,6 +2150,48 @@ state_set(enum redwood_sta_phase phase, const struct redwood_sta_bss *bss, int e
 	lck_spin_unlock(&state_lock);
 }
 
+/*
+ * The network joined, as the firmware has it (brcmf_update_bss_info [cfg80211]3529): its signal,
+ * channel and elements. A join by name alone -- the network the phone was given, joined before any
+ * scan heard it -- otherwise reaches iOS as 0 dBm on no channel with no RSN element: one bar, and
+ * shown as unsecured (27 October: "joined (0 dBm, 0 MHz)", wifid "RSSI:0").
+ */
+static void
+joined_bss_from_firmware(void)
+{
+	uint8_t *buf = kalloc_data(BSS_INFO_MAX, Z_WAITOK | Z_ZERO);
+	struct redwood_sta_bss *b = kalloc_data(sizeof(*b), Z_WAITOK | Z_ZERO);
+	uint32_t max = BSS_INFO_MAX;
+	int err = -1002;
+
+	if (buf != NULL && b != NULL) {
+		memcpy(buf, &max, 4);
+		err = ioctl(WLC_GET_BSS_INFO, buf, BSS_INFO_MAX, 4);
+		if (err == 0 && bss_fill(b, buf + 4, BSS_INFO_MAX - 4)) {
+			if (b->ssid_length == 0) {
+				memcpy(b->ssid, join_bss.ssid, join_bss.ssid_length);
+				b->ssid_length = join_bss.ssid_length;
+			}
+			join_bss = *b;
+		}
+		{
+			int32_t noise = 0;
+
+			if (ioctl(WLC_GET_PHY_NOISE, &noise, sizeof(noise), sizeof(noise)) == 0 && noise < 0 && noise > -128) {
+				join_bss.noise = (int16_t)noise;
+			}
+		}
+	}
+	blog("join: the network as the firmware has it: %d (%d dBm, noise %d dBm, %u MHz, %u bytes of elements)", err,
+	    join_bss.rssi, join_bss.noise, join_bss.frequency, join_bss.elements_length);
+	if (b != NULL) {
+		kfree_data(b, sizeof(*b));
+	}
+	if (buf != NULL) {
+		kfree_data(buf, BSS_INFO_MAX);
+	}
+}
+
 /* brcmf_msgbuf_flowring_create_worker() [msgbuf]588: flow ring 0 (ring 2), towards the access point */
 static bool
 flow_create(const uint8_t *da)
@@ -2584,6 +2644,7 @@ sta_join(const struct redwood_sta_join *what)
 			goto fail;
 		}
 	}
+	joined_bss_from_firmware();
 	state_set(REDWOOD_STA_JOINED, &join_bss, 0);
 	blog("W6 PASS: joined (%d dBm, %u MHz): en0's link is up", join_bss.rssi, join_bss.frequency);
 	redwood_net_link_state(true);
@@ -2602,6 +2663,43 @@ fail:
 static void
 sta_get_state(struct redwood_sta_state *state)
 {
+	/*
+	 * While joined, the signal as it is now (brcmf_cfg80211_get_station: BRCMF_C_GET_RSSI), at most
+	 * every two seconds, and only where waiting for the firmware is allowed and no request of ours is
+	 * under way (an event handled inside ioctl() can bring us here).
+	 */
+	static uint64_t rssi_at;
+	uint64_t now = mach_absolute_time(), every;
+	bool joined;
+	uint8_t peer[6];
+
+	nanoseconds_to_absolutetime(2 * NSEC_PER_SEC, &every);
+	lck_spin_lock(&state_lock);
+	joined = sta_state.phase == REDWOOD_STA_JOINED;
+	memcpy(peer, sta_state.bss.bssid, 6);
+	lck_spin_unlock(&state_lock);
+	if (joined && now - rssi_at >= every && preemption_enabled() && ioctl_owner == THREAD_NULL) {
+		uint8_t scb[12] = { 0 };
+		int32_t dbm;
+
+		rssi_at = now;
+		memcpy(scb + 4, peer, 6);
+		if (ioctl(WLC_GET_RSSI, scb, sizeof(scb), sizeof(scb)) == 0) {
+			memcpy(&dbm, scb, 4);
+			if (dbm < 0 && dbm > -128) {
+				lck_spin_lock(&state_lock);
+				sta_state.bss.rssi = (int16_t)dbm;
+				lck_spin_unlock(&state_lock);
+			}
+		}
+		/* the noise floor, which Apple80211 takes the signal's quality against (brcmf_cfg80211_dump_survey) */
+		dbm = 0;
+		if (ioctl(WLC_GET_PHY_NOISE, &dbm, sizeof(dbm), sizeof(dbm)) == 0 && dbm < 0 && dbm > -128) {
+			lck_spin_lock(&state_lock);
+			sta_state.bss.noise = (int16_t)dbm;
+			lck_spin_unlock(&state_lock);
+		}
+	}
 	lck_spin_lock(&state_lock);
 	*state = sta_state;
 	lck_spin_unlock(&state_lock);

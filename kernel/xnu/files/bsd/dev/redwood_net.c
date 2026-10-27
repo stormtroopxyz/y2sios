@@ -285,7 +285,9 @@ net_thread(__unused void *parameter, __unused wait_result_t result)
 			    net_count.sent, net_count.sent_bytes, net_count.received, net_count.received_bytes,
 			    net_count.dropped_out, net_count.dropped_in);
 		}
-		delay_for_interval(quiet < 100 ? 2 : 10, NSEC_PER_MSEC);
+		/* 2 ms while frames move, 10 ms after a fifth of a second without, 25 ms after some ten seconds:
+		 * a still phone's cores are woken 40 times a second for this, not 500 */
+		delay_for_interval(quiet < 100 ? 2 : quiet < 1100 ? 10 : 25, NSEC_PER_MSEC);
 	}
 }
 

@@ -2089,6 +2089,24 @@ redwood_ufs_init(void)
 		}
 	}
 
+	/* the whole storage, every logical unit, for iOS's capacity (iokit/Kernel/RedwoodStorage.cpp) */
+	{
+		extern void RedwoodStorageReport(unsigned long long bytes);
+		uint64_t total = 0;
+
+		for (uint32_t i = 0; i < ufs_parts; i++) {
+			const struct loader_block_part *e = &ufs_page->part[i];
+
+			if (e->flags & BLOCK_PART_UNIT) {
+				ufs_log("ufs: %s (LUN %u): %llu blocks of %u bytes, %llu MB\n", e->name, e->lun, e->blocks,
+				    e->block_size, (e->blocks * e->block_size) >> 20);
+				total += e->blocks * e->block_size;
+			}
+		}
+		ufs_log("ufs: the storage: %llu MB in all, given to iOS as disk0\n", total >> 20);
+		RedwoodStorageReport(total);
+	}
+
 	if (PE_parse_boot_argn("ufs_bench", &check, sizeof(check)) && check != 0) {
 		/* right here, in bsd_init's thread, and then back to the loader: nothing else is wanted */
 		ufs_bench(NULL, THREAD_AWAKENED);

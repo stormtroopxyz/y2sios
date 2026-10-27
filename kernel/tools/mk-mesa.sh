@@ -138,7 +138,8 @@ if [ "${AIR:-}" = 1 ]; then
 		"$(nm -gU out/libredwoodair.dylib | grep -c ' _rwa_') rwa_* functions)"
 	# what this library was built from, so userland/build.sh can tell that it is older than the
 	# sources and come back here instead of shipping it beside a driver that disagrees with it
-	cat "$ROOT"/tools/mesa/air/* | sha256sum > out/built-from-air
+	# (everything it is built from: its sources, the libdrm stand-in compiled into it, and the patches)
+	cat "$ROOT"/tools/mesa/air/* "$ROOT"/tools/mesa/redwood-drm/* "$ROOT"/tools/mesa/*.patch | sha256sum > out/built-from-air
 fi
 
 llvm-strip -x -o out/libOSMesa.8.dylib $BUILD/src/gallium/targets/osmesa/libOSMesa.8.dylib

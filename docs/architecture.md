@@ -125,7 +125,7 @@ The command line is stored in the XNUP payload, not compiled into the kernel. `.
 
 | Argument | Effect |
 |---|---|
-| `cpumask=0x3f` | use the four A55 cores and the two A76 cores |
+| `cpumask=0xff` | use all eight cores (`0x3f`: the four A55 and the two A76) |
 | `cpus=N` | use N cores; never combine with `cpumask` |
 | `touch_ts=1` | probe and poll the touch controller (2: probe only, 4: reset the bus) |
 | `bms=1` | MAX77705 battery and charger |
@@ -136,7 +136,15 @@ The command line is stored in the XNUP payload, not compiled into the kernel. `.
 | `fb_scaler=1` | zero-copy display scaler |
 | `fb_bl=1` | brightness and display power through DSIM |
 | `fb_threads=N` | helper threads for the copy path |
-| `dvfs=2` | ACPM DVFS |
+| `dvfs=2` | ACPM DVFS, the CPU and GPU governor and thermal steps |
+| `dvfs_cl2=2304000` | top clock of the M5 cluster |
+| `jit_flush=1` | trap user cache maintenance so JIT code is coherent on every core |
+| `cpuidle=1` | power idle cores down through PSCI `CPU_SUSPEND` |
+| `metal=1`, `camtl=1` | publish the Metal plug-in; CoreAnimation renders with Metal |
+| `metal_profile=1`, `mediamtl=1` | Metal capability profile; Metal for `mediaserverd` |
+| `autounlock=0` | start at the lock screen |
+| `fb_hot=C` | cap brightness from C degrees (default 90, `0` off) |
+| `touch_lat=1` | per-frame and touch timing lines |
 | `perf=1` | per-core clocks and boot timing |
 | `wifi_pcie=1..4` | PCIe look, link, DMA grants, full Wi-Fi |
 | `wifi_pcie_wait=N` | seconds before the PCIe work starts |
@@ -157,6 +165,8 @@ There are three channels, and they answer different questions.
 - **The console log ring** is written by `loader_log_line()` and by the display driver's `fbSay()`. It is the reliable channel: it survives a return to the loader and is served by `rwlogd` while iOS runs.
 - **The kernel message buffer** receives ordinary `printf` and `IOLog` output. It is smaller and wraps, so a plain `printf` can disappear before a log is pulled. `redwood_logd.c` publishes both the ring and the message buffer.
 - **The loader's own console** shows the UEFI and loader diagnostics before XNU starts. It shows only the tail on a long log, which is why the loader writes the full log to storage before printing it.
+
+**The m2m channel** (`bsd/dev/redwood_m2m.c`, `/dev/m2m`, `sysctl kern.m2m_log`) holds structured records from the Metal driver, the GPU, the display, power and input, `<seq> <seconds> <severity> <CATEGORY> <process>[<pid>] <message>`. `rwlogd` serves it at `/m2m`, and `./y2s.sh loop` saves and compares it run by run ([plans/10-mali2metal.md](plans/10-mali2metal.md)).
 
 `./y2s.sh log` reads the saved log from `recovery`+16 MiB over adb, strips NUL bytes and writes `../xnulog.txt`. `./y2s.sh wlog` fetches it over HTTP from the running phone. `./y2s.sh ulog` fetches it over USB from the boot menu.
 

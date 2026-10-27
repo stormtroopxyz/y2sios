@@ -28,6 +28,7 @@
  *       com.redwood.unlock      what the lock screen does after "swipe up to open"
  *       com.redwood.layers      write down the layers SpringBoard has on the screen: see layers()
  *       com.redwood.switcher    open the switcher of running applications: see switcher()
+ *       com.redwood.open        open a web page in Safari (mali2metal's tour): see open_page()
  *     In any other program given this library (INJECT in build.sh) only the last of them is
  *     answered, with that program's layers.
  */
@@ -495,7 +496,7 @@ lock_long_press(id self, SEL selector, id recognizer)
 
 #define UNLOCK_SOURCE_COVER_SHEET       24      /* what the lock screen itself passes */
 
-static void
+static BOOL
 unlock(void)
 {
 	Class cls = objc_getClass("SBLockScreenManager");
@@ -506,17 +507,20 @@ unlock(void)
 	if (cls == NULL || class_getClassMethod(cls, shared) == NULL || class_getInstanceMethod(cls, locked) == NULL ||
 	    class_getInstanceMethod(cls, unlock_ui) == NULL) {
 		say("redwood: unlock: SBLockScreenManager is not what it was\n");
-		return;
+		return YES;                      /* nothing to wait for */
 	}
 	manager = ((id (*)(Class, SEL))objc_msgSend)(cls, shared);
 	if (manager == NULL) {
 		say("redwood: unlock: no lock screen manager yet\n");
+		return NO;
 	} else if (!((BOOL (*)(id, SEL))objc_msgSend)(manager, locked)) {
 		say("redwood: unlock: not locked\n");
+		return YES;
 	} else {
 		BOOL done = ((BOOL (*)(id, SEL, long, id))objc_msgSend)(manager, unlock_ui, UNLOCK_SOURCE_COVER_SHEET, NULL);
 
 		say("redwood: unlock: asked, answer %d\n", done);
+		return YES;
 	}
 }
 
@@ -941,6 +945,57 @@ layers(void)
  * (_activateSwitcherValidatorWithEventLabel:animated:windowScene:), which is what its own
  * gestures use.
  */
+/*
+ * A web page in Safari, on the notification com.redwood.open: the tour's way into WebKit (its JIT and its
+ * GPU process), which a tap could reach only through wherever the user has put Safari's icon. SpringBoard
+ * opens it as any link it is handed: -[LSApplicationWorkspace openURL:]. Each notification opens the next
+ * page of /redwood/etc/m2m.url (one a line), or of the list below: a single page left WebKit's JIT faults
+ * unseen that three pages a minute later showed (PLANS/10-mali2metal.md, runs 23-24).
+ */
+static void
+open_page(void)
+{
+	static const char *const builtin[] = {
+		"https://www.apple.com/iphone/",
+		"https://en.wikipedia.org/wiki/IPhone",
+		"https://www.bbc.co.uk/news",
+	};
+	static unsigned next;
+	char url[512], lines[8][512];
+	unsigned count = 0;
+	FILE *f = fopen("/redwood/etc/m2m.url", "r");
+	Class workspace_class = objc_getClass("LSApplicationWorkspace");
+	Class url_class = objc_getClass("NSURL"), string_class = objc_getClass("NSString");
+	id workspace, string, link;
+	BOOL opened;
+
+	if (f != NULL) {
+		while (count < 8 && fgets(lines[count], sizeof(lines[count]), f) != NULL) {
+			lines[count][strcspn(lines[count], "\r\n")] = '\0';
+			if (lines[count][0] != '\0' && lines[count][0] != '#') {
+				count++;
+			}
+		}
+		fclose(f);
+	}
+	if (count > 0) {
+		strlcpy(url, lines[next % count], sizeof(url));
+	} else {
+		strlcpy(url, builtin[next % (sizeof(builtin) / sizeof(builtin[0]))], sizeof(url));
+	}
+	next++;
+	if (workspace_class == NULL || url_class == NULL || string_class == NULL) {
+		say("redwood: open: LSApplicationWorkspace is not here\n");
+		return;
+	}
+	workspace = ((id (*)(Class, SEL))objc_msgSend)(workspace_class, sel_registerName("defaultWorkspace"));
+	string = ((id (*)(Class, SEL, const char *))objc_msgSend)(string_class, sel_registerName("stringWithUTF8String:"), url);
+	link = ((id (*)(Class, SEL, id))objc_msgSend)(url_class, sel_registerName("URLWithString:"), string);
+	opened = workspace != NULL && link != NULL &&
+	    ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, sel_registerName("openURL:"), link);
+	say("redwood: open %s: %s\n", url, opened ? "handed to Safari" : "NOT opened");
+}
+
 static void
 switcher(void)
 {
@@ -1245,6 +1300,9 @@ redwood_springboard_init(void)
 	notify_register_dispatch("com.redwood.switcher", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		switcher();
 	});
+	notify_register_dispatch("com.redwood.open", &token, dispatch_get_main_queue(), ^(__unused int t) {
+		open_page();
+	});
 	/*
 	 * Belt-and-suspenders unlock. The user can always swipe up to open the home screen -- that
 	 * works fine when the touch driver is doing its job. But if touch is still probing, has
@@ -1267,7 +1325,22 @@ redwood_springboard_init(void)
 			return;
 		}
 	}
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-		unlock();
+	/*
+	 * Straight to the home screen: ask as soon as the lock screen exists rather than after a
+	 * fixed ten seconds. unlock() says whether there was anything to unlock (no manager yet,
+	 * or already unlocked), so this retries quickly until it takes and then stops.
+	 */
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 700 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+		__block int tries = 0;
+		void (^attempt)(void);
+
+		attempt = ^{
+			if (unlock() || ++tries >= 30) {
+				return;
+			}
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC),
+			    dispatch_get_main_queue(), attempt);
+		};
+		attempt();
 	});
 }

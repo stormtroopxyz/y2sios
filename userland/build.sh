@@ -358,10 +358,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			# contract warns about, and nothing in it said so. Silence is what made it expensive:
 			# the library is stripped, so the driver found the symbols it wanted and read a stride
 			# where a pixel format was.
-			grep -q panfrost $M/drivers 2>/dev/null ||      # (the AIR pieces are freedreno's: not with panfrost)
-			[ "$(cat $M/built-from-air 2>/dev/null)" = "$(cat ../tools/mesa/air/* | sha256sum)" ] || {
-				echo "build.sh: tools/mesa/air/ has changed since libredwoodair.dylib was built"
-				AIR=1 ../tools/mk-mesa.sh
+			[ "$(cat $M/built-from-air 2>/dev/null)" = "$(cat ../tools/mesa/air/* ../tools/mesa/redwood-drm/* ../tools/mesa/*.patch | sha256sum)" ] || {
+				echo "build.sh: libredwoodair.dylib is older than what it is built from (mk-mesa.sh's hash)"
+				AIR=1 DRIVERS=$(cat $M/drivers 2>/dev/null) ../tools/mk-mesa.sh
 			}
 			./mkeagl.py src/eagl_slots.txt $M/gl.xml $M/exported-gl.txt src/eagl.c > obj/eagl_gen.h
 			$DYN -dynamiclib -install_name /redwood/lib/libredwood-gl.dylib -Iobj -framework CoreFoundation \
@@ -406,6 +405,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/metal_test ] && cp obj/metal_test root/bin/
 	[ -f obj/net_test ] && cp obj/net_test root/bin/
 	[ -f obj/rwlogd ] && cp obj/rwlogd root/bin/
+	[ -f obj/m2m_mark ] && cp obj/m2m_mark root/bin/
 	[ -f obj/bluetool_stub ] && cp obj/bluetool_stub root/bin/
 	[ -f obj/store_test ] && cp obj/store_test root/bin/
 	[ -f obj/battery_test ] && cp obj/battery_test root/bin/
@@ -556,6 +556,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	fi
 	cp ${RC:-rc.launchd} root/etc/rc
 	cp ${RC_JOBS:-rc.jobs} root/etc/rc.jobs
+	cp m2m.tour root/etc/m2m.tour        # mali2metal's standard tour (rwlogd GET /tour)
 	# QUIET=1: launchd's own standard error goes nowhere (src/init.c). It says a few thousand
 	# lines about its own business in the first minutes and pushes everything else out of the
 	# kernel's log; the daemons keep their own standard error on the console all the same.

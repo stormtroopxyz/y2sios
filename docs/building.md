@@ -70,14 +70,16 @@ rsync -a "$SNAP/kernel/xnuloader/" xnuloader/
 rsync -a "$SNAP/kernel/common/" common/
 rsync -a "$SNAP/kernel/tools/" tools/
 rsync -a "$SNAP/userland/src/" userland/src/
-cp "$SNAP/kernel/y2s.sh" .
+cp "$SNAP/kernel/y2s.sh" "$SNAP/kernel/m2m.cmdline" .
 cp "$SNAP/userland/build-gpu-y2s.sh" "$SNAP/userland/build.sh" \
    "$SNAP/userland/mkjobs.py" "$SNAP/userland/mkeagl.py" userland/
 cp "$SNAP/userland"/rc.* userland/
 cp "$SNAP/userland"/*.plist userland/
-cp "$SNAP/userland/hfs-kit.bin" userland/
+cp "$SNAP/userland/hfs-kit.bin" "$SNAP/userland/m2m.tour" userland/
 rsync -a "$SNAP/userland/libmini/" userland/libmini/
 ```
+
+The analysis tools (`tools/dsc*.py`) need `pip3 install --user capstone` and the extracted shared cache in `ios165/`.
 
 The `xnu/` directory now contains the y2s overlay: `redwood.patch`, `files/`, `apply.sh` and `export.sh`. If the upstream tree already has a different `xnu/redwood.patch`, our copy replaces it. That is intentional; this snapshot is the complete kernel state.
 
@@ -191,8 +193,10 @@ The userland build needs:
 Build the GPU pieces and the images:
 
 ```sh
-RC_JOBS=rc.jobs.y2s ./build-gpu-y2s.sh
+QUIET=1 RC=rc.launchd.metal RC_JOBS=rc.jobs.manual ./build-gpu-y2s.sh
 ```
+
+`RC=rc.launchd.metal` sets up the Metal plug-in before the window server starts; without it CoreAnimation uses OpenGL ES.
 
 The script builds Mesa into `xnu-deps/build/mesa/out`, builds `libOSMesa.8.dylib`, `libredwood-gl.dylib`, the Metal libraries, the tests and `init`, then calls `build.sh` with `GL=1`.
 
@@ -203,7 +207,7 @@ The script builds Mesa into `xnu-deps/build/mesa/out`, builds `libOSMesa.8.dylib
 
 The system image can be rebuilt with `SYSTEM=1`. It is not committed.
 
-For a boot that roots from the flash and keeps `/var` on `userdata`, use the command line shown in the README. The first boot creates the HFS+ volume from `hfs-kit.bin`; later boots mount it.
+For a boot that roots from the flash and keeps `/var` on `userdata`, use `m2m.cmdline`, the standard command line shown in the README. The first boot creates the HFS+ volume from `hfs-kit.bin`; later boots mount it.
 
 ## Firmware
 
@@ -225,9 +229,11 @@ The audio path does not need the DSP firmware on the first attempt, because the 
 ## Pack
 
 ```sh
-./y2s.sh payload "<cmdline>"
+./y2s.sh payload "$(cat m2m.cmdline)"
 ./y2s.sh pack
 ```
+
+With iOS already running on Wi-Fi, `./y2s.sh loop LABEL` builds, flashes, boots, runs the standard tour and reports the m2m channel against the previous run.
 
 `payload` rebuilds the loader and the XNUP container, reads the exact size of `root.apfs`, and splices the container into `out/y2s-embed.img`. If `root.apfs` changes size, run `payload` again before `pack`. The loader reads exactly the size recorded in the payload; a mismatch produces an APFS error and a halt on the Silicium screen.
 
@@ -291,6 +297,12 @@ heimdall flash --BOOT backup-y2s/boot.img
 ```
 
 `wlog` uses Bonjour to find `HackiOS._http._tcp`. If Bonjour is slow, set `Y2S_IP=address`.
+
+```sh
+./y2s.sh m2m fetch --label NAME   # the m2m channel into logs/m2m/
+./y2s.sh m2m report RUN           # what a run says, compared with the run before
+python3 tools/frame_split.py LOG  # per-frame timing from a touch_lat=1 log
+```
 
 ## Common failures
 

@@ -739,6 +739,10 @@ enum {
 	CTX_ICC_PMR, CTX_ICC_IGRPEN1, CTX_ICC_BPR1, CTX_COUNT
 };
 uint64_t loader_ctx[CTX_COUNT];
+
+/* set when the kernel hands back asking for Log access (CTX_REASON 3, kern.redwood_menu) */
+static int y2s_want_log_access;
+static int y2s_want_download;
 int loader_save_ctx(void);
 void loader_return_stub(void);
 
@@ -921,6 +925,15 @@ struct {
  */
 void kernel_cpu_trampoline(void);
 extern uint64_t kernel_cpu_slot[2];
+/*
+ * ... and kernel_cpu_resume for a core coming back from PSCI CPU_SUSPEND (a power-down idle: XNU's
+ * redwood_cpuidle.c). Any core may wake at any time, so one shared slot cannot say which it is; and its
+ * MPIDR alone is ambiguous on this SoC (A55 #1 masks to the id M5 #0 is registered under). The kernel fills
+ * kernel_cpu_resume_data: [0] its reset vector, then up to eight pairs { MPIDR & 0xffffff, phys id }; the
+ * trampoline finds its own MPIDR there and enters the kernel with that phys id in x0, as kernel_cpu_trampoline.
+ */
+void kernel_cpu_resume(void);
+extern uint64_t kernel_cpu_resume_data[17];
 volatile uint64_t other_cpu_stage __attribute__((aligned(64)));  /* 1: that core has reached other_cpu_entry */
 volatile uint64_t other_cpu_done __attribute__((aligned(64)));   /* 1: the kernel is back (other_cpu_return_stub) */
 uint64_t psci_by_hvc __attribute__((aligned(64)));
@@ -968,6 +981,30 @@ __asm__ (
         ".globl kernel_cpu_slot\n"
         "kernel_cpu_slot:\n"
         "  .quad 0, 0\n"
+        ".balign 64\n"
+        ".globl kernel_cpu_resume\n"
+        "kernel_cpu_resume:\n"                /* MMU off: find this core in the table by its MPIDR */
+        "  mrs x11, mpidr_el1\n"
+        "  and x11, x11, #0xffffff\n"
+        "  adr x9, kernel_cpu_resume_data\n"
+        "  ldr x12, [x9], #8\n"               /* the kernel's reset vector */
+        "  mov x13, #8\n"
+        "1:\n"
+        "  ldp x10, x0, [x9], #16\n"
+        "  cmp x10, x11\n"
+        "  b.eq 2f\n"
+        "  subs x13, x13, #1\n"
+        "  b.ne 1b\n"
+        "3:\n"                                 /* not in the table: nothing to enter; stay out of the way */
+        "  wfi\n"
+        "  b 3b\n"
+        "2:\n"
+        "  cbz x12, 3b\n"
+        "  br x12\n"
+        ".balign 64\n"
+        ".globl kernel_cpu_resume_data\n"
+        "kernel_cpu_resume_data:\n"
+        "  .fill 17, 8, 0\n"
         ".balign 64\n"
         "other_cpu_fault:\n"                    /* as an early exception in the kernel: reason 1 */
         "  mrs x3, esr_el1\n"
@@ -3528,6 +3565,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* ... and where it may start them from: below 4 GB, with a slot for the real entry (see kernel_cpu_trampoline) */
 	dt_prop_u64(&w, "psci-cpu-on-trampoline", (uint64_t)(uintptr_t)&kernel_cpu_trampoline);
 	dt_prop_u64(&w, "psci-cpu-on-slot", (uint64_t)(uintptr_t)kernel_cpu_slot);
+	/* ... and where a core coming back from a power-down idle enters (see kernel_cpu_resume) */
+	dt_prop_u64(&w, "psci-cpu-resume-trampoline", (uint64_t)(uintptr_t)&kernel_cpu_resume);
+	dt_prop_u64(&w, "psci-cpu-resume-data", (uint64_t)(uintptr_t)kernel_cpu_resume_data);
 	/* the time now, by the firmware's clock (the kernel has no real-time clock driver) */
 	uint64_t epoch = firmware_epoch();
 	if (epoch != 0) {
@@ -3784,7 +3824,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		flush_dcache(phys_base, top);
 		/* the kernel writes the slot uncached and new cores read it with their caches off (the slot
 		 * is in .text, which the firmware maps read-only: not written from here, it is 0 in the image) */
-		flush_dcache((uint64_t)(uintptr_t)&kernel_cpu_trampoline, (uint64_t)(uintptr_t)kernel_cpu_slot + 64);
+		flush_dcache((uint64_t)(uintptr_t)&kernel_cpu_trampoline,
+		    (uint64_t)(uintptr_t)kernel_cpu_resume_data + sizeof(uint64_t) * 17);
 		console_suspect = PLAT == &platform_y2s;
 		if (checkpoint == CHECKPOINT_SELFTEST) {
 			/* Do not enter the kernel at all: exercise only the return path. */
@@ -3869,13 +3910,20 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	const char *klog = (const char *)loader_ctx[CTX_LOG_PA];
 	uint64_t klog_len = loader_ctx[CTX_LOG_LEN];
 	uint64_t reason = loader_ctx[CTX_REASON];
+
+	if (reason == 3) {
+		y2s_want_log_access = 1;
+	} else if (reason == 4) {
+		y2s_want_download = 1;      /* the kernel asked for Download Mode */
+	}
 	if (checkpoint == CHECKPOINT_SELFTEST) {
 		print("return-path self test passed\n");
 		set_result("selftest-ok", 0, 0);
 		klog = NULL;
 		klog_len = 0;
 	} else {
-		print("kernel returned: log at %x, %d bytes\n", (uint64_t)(uintptr_t)klog, klog_len);
+		print("kernel returned: reason %d, log at %x, %d bytes\n", reason,
+		    (uint64_t)(uintptr_t)klog, klog_len);
 		if (reason == 2) {
 			print("STOPPED AT CHECKPOINT %d\n", loader_ctx[CTX_ESR]);
 			set_result("checkpoint", loader_ctx[CTX_ESR], 0);
@@ -4983,8 +5031,21 @@ y2s_menu_loop(void)
 	int wait = 3;
 
 	for (;;) {
-		int choice = menu_choose(banner, wait);
+		int choice;
 
+		if (y2s_want_download) {
+			y2s_want_download = 0;
+			menu_status("Download Mode", "the kernel asked for it", NULL, NULL, NULL);
+			reboot_download();
+		}
+		if (y2s_want_log_access) {
+			y2s_want_log_access = 0;
+			choice = MENU_USB;
+			wait = 0;
+			banner = "the kernel asked for Log access";
+		} else {
+			choice = menu_choose(banner, wait);
+		}
 		wait = 0;
 		if (choice == MENU_USB) {
 			if (!log_access()) {

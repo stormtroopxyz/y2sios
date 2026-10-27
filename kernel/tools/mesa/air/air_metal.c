@@ -61,13 +61,15 @@
 #endif
 #include "util/format/u_format.h"
 #include "util/half_float.h"
+#include "util/u_atomic.h"
 #include "util/u_inlines.h"
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
 #include "util/set.h"
 
 /* the Metal driver keeps its own copy of this struct (userland/src/redwoodmetal.m) */
-_Static_assert(sizeof(struct rwa_draw) == 304 && offsetof(struct rwa_draw, viewport) == 296,
+_Static_assert(sizeof(struct rwa_draw) == 328 && offsetof(struct rwa_draw, viewport) == 296 &&
+               offsetof(struct rwa_draw, color_level) == 304 && offsetof(struct rwa_draw, depth_level) == 320,
                "struct rwa_draw must match userland/src/redwoodmetal.m");
 
 /*
@@ -165,6 +167,22 @@ struct rwa_device {
     * construction: a buffer joins only when something is encoded into it.
     */
    struct rwa_buffer *encoded;
+
+   /* is_null_texture's answer (air_shader_info.null_query_ubo): per stage, the slots the
+    * last bind_stage bound, one bit each. Bound as a user constant buffer, which Panfrost
+    * reads when the draw or dispatch is emitted, so it has to outlive the bind. */
+   uint32_t null_query_word[PIPE_SHADER_TYPES][4];
+
+   /* What a slot a shader asks is_null_texture about is bound to when the caller left it
+    * empty: one texel of zeros of the declared shape, so the GPU is never given an empty
+    * descriptor (the shader's own test keeps it from reading it). Made when first needed. */
+   struct {
+      enum pipe_texture_target target;
+      enum pipe_format format;
+      struct pipe_resource *res;
+      struct pipe_sampler_view *view;
+   } placeholder[8];
+   unsigned placeholders;
 };
 
 /*
@@ -240,9 +258,26 @@ struct rwa_texture {
     * keys a batch by the surfaces' pointers, so one surface per texture is what lets the
     * draws of a pass share one batch instead of each paying a whole-target fragment job */
    struct pipe_surface *surface;
+   /* ... and of any other level or slice drawn into, made and kept the same way */
+   struct {
+      unsigned level, layer;
+      struct pipe_surface *surface;
+   } other[8];
+   unsigned others, next_other;
    struct rwa_texture_shape shape;
    const char *format_name;         /* the MTLPixelFormat, spelled out */
    unsigned layers;                 /* array slices, or the six faces of a cube */
+
+   /* What the GPU is shown of `res`. A texture made by this library shows all of it in its
+    * own format; a VIEW (rwa_texture_view) is a second texture over the same resource -- one
+    * more reference on it -- that shows `levels` levels from `base_level` and `layers` slices
+    * from `base_layer`, in a format of the same texel size. Every level and slice this
+    * library is handed is the view's, and becomes the resource's here and nowhere else:
+    * texture_box, texture_surface, the sampler and image views, the copy and the mipmaps. */
+   enum pipe_format format;
+   enum pipe_texture_target target;
+   unsigned base_level, levels, base_layer;
+   bool is_view;
 
    /* what MTLTextureUsage allowed, which is checked at every dispatch: a kernel that
     * writes a texture the application declared read-only is an application's mistake,
@@ -778,10 +813,55 @@ rwa_device_close(struct rwa_device *device)
       return;
    if (device->default_sampler)
       device->pipe->delete_sampler_state(device->pipe, device->default_sampler);
+   for (unsigned i = 0; i < device->placeholders; i++) {
+      if (device->placeholder[i].view)
+         device->pipe->sampler_view_destroy(device->pipe, device->placeholder[i].view);
+      pipe_resource_reference(&device->placeholder[i].res, NULL);
+   }
    device->pipe->destroy(device->pipe);
    device->screen->destroy(device->screen);
    free(device);
    glsl_type_singleton_decref();
+}
+
+#ifdef GALLIUM_PANFROST
+/* pan_bo.c's (tools/mesa/panfrost-retain.patch) */
+struct redwood_bo_cache_stats {
+   uint64_t hits, misses, evicted, evicted_bytes;
+   uint64_t cached_bytes, cached_bos;
+};
+extern struct redwood_bo_cache_stats redwood_bo_cache_stats;
+#endif
+
+/* constant buffer bindings: given to the GPU as they are, or copied (Panfrost uploads a user buffer at every draw) */
+static uint64_t rwa_ubo_direct, rwa_ubo_copied, rwa_ubo_copied_bytes;
+
+int
+rwa_ubo_stats(uint64_t out[3])
+{
+   out[0] = p_atomic_read(&rwa_ubo_direct);
+   out[1] = p_atomic_read(&rwa_ubo_copied);
+   out[2] = p_atomic_read(&rwa_ubo_copied_bytes);
+   return 0;
+}
+
+int
+rwa_gpu_cache_stats(uint64_t out[6])
+{
+#ifdef GALLIUM_PANFROST
+   const struct redwood_bo_cache_stats s = redwood_bo_cache_stats;   /* (a racy copy: counters for a record) */
+
+   out[0] = s.hits;
+   out[1] = s.misses;
+   out[2] = s.evicted;
+   out[3] = s.evicted_bytes;
+   out[4] = s.cached_bytes;
+   out[5] = s.cached_bos;
+   return 0;
+#else
+   memset(out, 0, 6 * sizeof(out[0]));
+   return -1;
+#endif
 }
 
 const char *
@@ -1213,7 +1293,8 @@ pixel_format_refusal(unsigned f)
    if (f == 261 || f == 262)
       return "one of the X*_Stencil8 formats, which is not a texture but a view of the "
              "stencil aspect of one made as Depth32Float_Stencil8: it comes from "
-             "-newTextureViewWithPixelFormat:, which this library does not do, and "
+             "-newTextureViewWithPixelFormat:, whose stencil-aspect form this library "
+             "does not make, and "
              "rwa_depth_read asks for an aspect of the texture itself instead";
    if (f >= 250 && f <= 262)
       return "a depth or stencil format of Metal's enumeration that this library has no "
@@ -1233,7 +1314,9 @@ struct rwa_surface_import {
    int id;
    unsigned offset, row_bytes;
    unsigned chroma_offset, chroma_row_bytes;   /* a two-plane format's second plane; 0: none */
+   const char *kind;                           /* what `id` names, for refusals: NULL an IOSurface */
 };
+#define IMPORT_KIND(import) ((import)->kind ? (import)->kind : "IOSurface")
 
 static struct rwa_texture *
 texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shape,
@@ -1287,26 +1370,26 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
     */
    if (import) {
       if (shape->type != RWA_TYPE_2D) {
-         say(why, why_size, "a %s over an IOSurface: an imported surface is row-major "
-                            "memory with one pitch, and only a MTLTextureType2D can be laid "
-                            "over it without an agreement about where further levels live",
-             type_name);
+         say(why, why_size, "a %s over an %s: imported memory is row-major with one pitch, "
+                            "and only a MTLTextureType2D can be laid over it without an "
+                            "agreement about where further levels live",
+             type_name, IMPORT_KIND(import));
          return NULL;
       }
       if (mips != 1) {
-         say(why, why_size, "%u mip levels over an IOSurface: the import is told one pitch "
+         say(why, why_size, "%u mip levels over an %s: the import is told one pitch "
                             "and nothing about smaller levels, so there is nowhere for them "
-                            "to be", mips);
+                            "to be", mips, IMPORT_KIND(import));
          return NULL;
       }
       if (layers != 1 || depth != 1) {
-         say(why, why_size, "%u slices and a depth of %u over an IOSurface: the import is "
-                            "one plane of one image", layers, depth);
+         say(why, why_size, "%u slices and a depth of %u over an %s: the import is "
+                            "one plane of one image", layers, depth, IMPORT_KIND(import));
          return NULL;
       }
       if (import->row_bytes == 0) {
-         say(why, why_size, "an IOSurface with no bytes a row: the import takes the pitch "
-                            "from the caller and cannot guess it");
+         say(why, why_size, "an %s with no bytes a row: the import takes the pitch "
+                            "from the caller and cannot guess it", IMPORT_KIND(import));
          return NULL;
       }
    }
@@ -1564,6 +1647,9 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
    texture->layers = array_size;
    texture->shader_read = read;
    texture->shader_write = write;
+   texture->format = fmt->pipe;
+   texture->target = target;
+   texture->levels = mips;
 
    struct pipe_resource templ = {
       .target = target, .format = fmt->pipe,
@@ -1605,19 +1691,20 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
        */
       unsigned texel = util_format_get_blocksize(fmt->pipe);
       if (import->row_bytes < width * texel) {
-         say(why, why_size, "IOSurface %d has %u bytes a row, and %u texels of %u bytes "
+         say(why, why_size, "%s %d has %u bytes a row, and %u texels of %u bytes "
                             "need at least %u: this GPU's import refuses a pitch narrower "
-                            "than the image", import->id, import->row_bytes, width, texel,
-             width * texel);
+                            "than the image", IMPORT_KIND(import), import->id, import->row_bytes,
+             width, texel, width * texel);
          free(texture);
          return NULL;
       }
       if (import->row_bytes % 64 != 0) {
-         say(why, why_size, "IOSurface %d has %u bytes a row, which is not a multiple of "
+         say(why, why_size, "%s %d has %u bytes a row, which is not a multiple of "
                             "64: this GPU lays out a row aligned to that and its import "
                             "refuses a pitch it would have to change (the kernel's own "
-                            "surfaces are aligned to 64 already)", import->id,
-             import->row_bytes);
+                            "surfaces are aligned to 64 already, and this device answers 64 to "
+                            "minimumLinearTextureAlignmentForPixelFormat)", IMPORT_KIND(import),
+             import->id, import->row_bytes);
          free(texture);
          return NULL;
       }
@@ -1677,6 +1764,14 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
           * surface's memory over -- which it does for a surface built around memory of a
           * process's own -- and a surface ID the kernel's table does not hold.
           */
+         if (import->kind != NULL) {
+            say(why, why_size, "%s would not lay a %ux%u %s of %s with %u bytes a row over "
+                               "the %s from offset %u (its linear layout: "
+                               "pan_image_layout_init)", rwa_device_name(device), width, height,
+                type_name, fmt->name, import->row_bytes, import->kind, import->offset);
+            free(texture);
+            return NULL;
+         }
          say(why, why_size, "%s would not take IOSurface %d as a %ux%u %s of %s with %u "
                             "bytes a row from offset %u, and the pitch and the shape are "
                             "both acceptable, so what is left is the surface itself: the "
@@ -1752,6 +1847,213 @@ rwa_texture_from_surface_planes(struct rwa_device *device, const struct rwa_text
    return texture_of_shape(device, shape, &import, why, why_size);
 }
 
+/*
+ * A texture over a buffer's memory (-[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]): the same
+ * GPU buffer object, laid out as a linear 2D image from `offset` with `row_bytes` a row. The buffer object
+ * is handed from the buffer to the texture inside this process (the DRM shim's in-process export,
+ * tools/mesa/redwood-drm), so the two are one memory, as in Metal: what the CPU or the GPU writes through
+ * one is what the other reads. Everything texture_of_shape refuses for an import it refuses here.
+ */
+struct rwa_texture *
+rwa_texture_from_buffer(struct rwa_buffer *buffer, const struct rwa_texture_shape *shape,
+                        size_t offset, size_t row_bytes, char *why, size_t why_size)
+{
+   RWA_GUARD();
+   if (!buffer) {
+      say(why, why_size, "a texture over no buffer");
+      return NULL;
+   }
+   struct rwa_device *device = buffer->device;
+   const struct rwa_pixel_format *fmt = shape ? pixel_format(shape->pixel_format) : NULL;
+   unsigned height = shape && shape->height ? shape->height : 1;
+
+   if (fmt && (offset > buffer->size || (size_t)row_bytes * height > buffer->size - offset)) {
+      say(why, why_size, "%u rows of %zu bytes from offset %zu of a buffer of %zu bytes", height,
+          row_bytes, offset, buffer->size);
+      return NULL;
+   }
+   if (fmt && offset % util_format_get_blocksize(fmt->pipe) != 0) {
+      say(why, why_size, "a texture of %s at offset %zu of a buffer: Metal asks for an offset that "
+                         "is a multiple of the texel (%u bytes)", fmt->name, offset,
+          util_format_get_blocksize(fmt->pipe));
+      return NULL;
+   }
+   struct winsys_handle out = { .type = WINSYS_HANDLE_TYPE_FD };
+   if (device->software || !device->screen->resource_get_handle ||
+       !device->screen->resource_get_handle(device->screen, NULL, buffer->res, &out, 0)) {
+      say(why, why_size, "%s would not hand this buffer's memory over to a texture", rwa_device_name(device));
+      return NULL;
+   }
+   const struct rwa_surface_import import = {
+      .id = (int)out.handle, .offset = (unsigned)offset, .row_bytes = (unsigned)row_bytes,
+      .kind = "buffer" };
+
+   return texture_of_shape(device, shape, &import, why, why_size);
+}
+
+/* Metal's view casts, from Apple's table for -newTextureViewWithPixelFormat:textureType:
+ * levels:slices: (1D -> 1D; 2D -> 2D, 2DArray; 2DArray, Cube, CubeArray -> any of those four;
+ * 3D -> 3D). The table has no row for the others, so each is its own type only. */
+static bool
+view_type_allowed(unsigned from, unsigned to)
+{
+   bool layered_2d = from == RWA_TYPE_2D_ARRAY || from == RWA_TYPE_CUBE ||
+                     from == RWA_TYPE_CUBE_ARRAY;
+   if (from == RWA_TYPE_2D)
+      return to == RWA_TYPE_2D || to == RWA_TYPE_2D_ARRAY;
+   if (layered_2d)
+      return to == RWA_TYPE_2D || to == RWA_TYPE_2D_ARRAY || to == RWA_TYPE_CUBE ||
+             to == RWA_TYPE_CUBE_ARRAY;
+   return from == to;
+}
+
+static enum pipe_texture_target
+view_target(unsigned type)
+{
+   switch (type) {
+   case RWA_TYPE_1D: return PIPE_TEXTURE_1D;
+   case RWA_TYPE_1D_ARRAY: return PIPE_TEXTURE_1D_ARRAY;
+   case RWA_TYPE_2D:
+   case RWA_TYPE_2D_MULTISAMPLE: return PIPE_TEXTURE_2D;
+   case RWA_TYPE_2D_ARRAY:
+   case RWA_TYPE_2D_MULTISAMPLE_ARRAY: return PIPE_TEXTURE_2D_ARRAY;
+   case RWA_TYPE_CUBE: return PIPE_TEXTURE_CUBE;
+   case RWA_TYPE_CUBE_ARRAY: return PIPE_TEXTURE_CUBE_ARRAY;
+   default: return PIPE_TEXTURE_3D;
+   }
+}
+
+struct rwa_texture *
+rwa_texture_view(struct rwa_texture *texture, unsigned mtl_format, unsigned type,
+                 unsigned first_level, unsigned levels, unsigned first_slice,
+                 unsigned slices, char *why, size_t why_size)
+{
+   RWA_GUARD();
+   if (!texture) {
+      say(why, why_size, "a view of no texture");
+      return NULL;
+   }
+   struct rwa_device *device = texture->device;
+   const struct rwa_pixel_format *fmt = pixel_format(mtl_format);
+   if (!fmt) {
+      say(why, why_size, "a view as pixel format %u, which is %s", mtl_format,
+          pixel_format_refusal(mtl_format));
+      return NULL;
+   }
+   const char *type_name = texture_type_name(type);
+   if (!type_name) {
+      say(why, why_size, "a view as texture type %u, which is not one of MTLTextureType's ten",
+          type);
+      return NULL;
+   }
+   /* a two-plane texture is two resources (res->next), and a view of one would have to say
+    * which plane it is */
+   if (util_format_get_num_planes(texture->res->format) != 1) {
+      say(why, why_size, "a view of a two-plane %s", texture->format_name);
+      return NULL;
+   }
+   if (!view_type_allowed(texture->shape.type, type)) {
+      say(why, why_size, "a %s viewed as a %s, which Metal's table of view casts does not "
+                         "allow", texture_type_name(texture->shape.type), type_name);
+      return NULL;
+   }
+
+   /* Apple's rule: colour formats of the same bit length view each other; a depth or
+    * stencil format is viewed as itself or as the stencil format of its own kind, and the
+    * latter has no Gallium format here (pixel_format refuses X32_Stencil8 by name). The
+    * block is compared as well as its size, which keeps a compressed format to itself. */
+   bool zs_from = format_is_depth_stencil(texture->format);
+   bool zs_to = format_is_depth_stencil(fmt->pipe);
+   if ((zs_from || zs_to) && fmt->pipe != texture->format) {
+      say(why, why_size, "%s viewed as %s: a depth or stencil texture is viewed as its own "
+                         "format, or as the stencil-aspect format of its kind, which this "
+                         "library has no Gallium format for", texture->format_name, fmt->name);
+      return NULL;
+   }
+   if (util_format_get_blocksize(fmt->pipe) != util_format_get_blocksize(texture->format) ||
+       util_format_get_blockwidth(fmt->pipe) != util_format_get_blockwidth(texture->format) ||
+       util_format_get_blockheight(fmt->pipe) != util_format_get_blockheight(texture->format)) {
+      say(why, why_size, "%s viewed as %s, whose texels are not the same size: Metal views "
+                         "a colour format only as one of the same bit length",
+          texture->format_name, fmt->name);
+      return NULL;
+   }
+
+   /* the ranges are the parent's own (a view of a view counts from the view) */
+   if (levels == 0 || first_level >= texture->levels ||
+       levels > texture->levels - first_level) {
+      say(why, why_size, "levels %u..%u of a texture with %u", first_level,
+          first_level + levels, texture->levels);
+      return NULL;
+   }
+   bool volume = texture->shape.type == RWA_TYPE_3D;
+   unsigned have_slices = volume ? 1 : texture->layers;
+   if (slices == 0 || first_slice >= have_slices || slices > have_slices - first_slice) {
+      say(why, why_size, "slices %u..%u of a texture with %u", first_slice,
+          first_slice + slices, have_slices);
+      return NULL;
+   }
+   if ((type == RWA_TYPE_2D || type == RWA_TYPE_1D || type == RWA_TYPE_3D ||
+        type == RWA_TYPE_2D_MULTISAMPLE) && slices != 1) {
+      say(why, why_size, "a %s view of %u slices: that type has one", type_name, slices);
+      return NULL;
+   }
+   if ((type == RWA_TYPE_CUBE && slices != 6) || (type == RWA_TYPE_CUBE_ARRAY && slices % 6)) {
+      say(why, why_size, "a %s view of %u slices: Metal asks for %s", type_name, slices,
+          type == RWA_TYPE_CUBE ? "6" : "a multiple of 6");
+      return NULL;
+   }
+
+   /* the GPU's own answer for the view's format, for each binding the texture has */
+   enum pipe_texture_target target = view_target(type);
+   unsigned samples = texture->res->nr_samples;
+   static const struct { unsigned bind; const char *what; } binds[] = {
+      { PIPE_BIND_SAMPLER_VIEW, "sample" },
+      { PIPE_BIND_SHADER_IMAGE, "store to" },
+      { PIPE_BIND_RENDER_TARGET, "render to" },
+      { PIPE_BIND_DEPTH_STENCIL, "test depth in" },
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(binds); i++) {
+      if ((texture->res->bind & binds[i].bind) &&
+          !device->screen->is_format_supported(device->screen, fmt->pipe, target, samples,
+                                               samples, binds[i].bind)) {
+         say(why, why_size, "%s cannot %s a %s of %s, which a view of this %s would be",
+             rwa_device_name(device), binds[i].what, type_name, fmt->name,
+             texture->format_name);
+         return NULL;
+      }
+   }
+
+   struct rwa_texture *view = calloc(1, sizeof(*view));
+   if (!view) {
+      say(why, why_size, "out of memory making a texture view");
+      return NULL;
+   }
+   unsigned base = texture->base_level + first_level;
+   view->device = device;
+   pipe_resource_reference(&view->res, texture->res);
+   view->shape = texture->shape;
+   view->shape.pixel_format = mtl_format;
+   view->shape.type = type;
+   view->shape.width = u_minify(texture->res->width0, base);
+   view->shape.height = u_minify(texture->res->height0, base);
+   view->shape.depth = volume ? u_minify(texture->res->depth0, base) : 1;
+   view->shape.mip_levels = levels;
+   view->shape.array_length = type == RWA_TYPE_CUBE_ARRAY ? slices / 6 :
+                              type == RWA_TYPE_CUBE ? 1 : slices;
+   view->format_name = fmt->name;
+   view->layers = volume ? 1 : slices;
+   view->shader_read = texture->shader_read;
+   view->shader_write = texture->shader_write;
+   view->format = fmt->pipe;
+   view->target = target;
+   view->base_level = base;
+   view->levels = levels;
+   view->base_layer = texture->base_layer + (volume ? 0 : first_slice);
+   view->is_view = true;
+   return view;
+}
+
 void
 rwa_texture_destroy(struct rwa_texture *texture)
 {
@@ -1768,7 +2070,10 @@ rwa_texture_destroy(struct rwa_texture *texture)
    if (texture->view)
       texture->device->pipe->sampler_view_destroy(texture->device->pipe, texture->view);
    pipe_surface_reference(&texture->surface, NULL);   /* (a pending batch holds its own) */
-   if (texture->res && texture->res->next && util_format_get_num_planes(texture->res->format) == 2) {
+   for (unsigned i = 0; i < texture->others; i++)
+      pipe_surface_reference(&texture->other[i].surface, NULL);
+   if (!texture->is_view && texture->res && texture->res->next &&
+       util_format_get_num_planes(texture->res->format) == 2) {
       struct pipe_resource *uv = texture->res->next;
 
       texture->res->next = NULL;
@@ -1800,10 +2105,12 @@ texture_box(const struct rwa_texture *texture, unsigned level, unsigned layer,
     */
    unsigned o[3] = { origin ? origin[0] : 0, origin ? origin[1] : 0, origin ? origin[2] : 0 };
 
-   if (level > res->last_level) {
-      say(why, why_size, "level %u of a texture with %u", level, res->last_level + 1);
+   if (level >= texture->levels) {
+      say(why, why_size, "level %u of a texture with %u", level, texture->levels);
       return false;
    }
+   /* from here the resource's level: the box is Gallium's, and Gallium knows no view */
+   level += texture->base_level;
 
    bool volume = res->target == PIPE_TEXTURE_3D;
    bool rows = res->target != PIPE_TEXTURE_1D && res->target != PIPE_TEXTURE_1D_ARRAY;
@@ -1827,6 +2134,7 @@ texture_box(const struct rwa_texture *texture, unsigned level, unsigned layer,
    }
 
    *box = (struct pipe_box){ .x = o[0], .width = s[0] };
+   layer += texture->base_layer;
    if (!rows) {
       box->y = layer;
       box->height = 1;
@@ -1931,7 +2239,8 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
     * what -replaceRegion:...bytesPerRow:bytesPerImage: is given when bytesPerImage is
     * the obvious product.
     */
-   texture->device->pipe->texture_subdata(texture->device->pipe, texture->res, level,
+   texture->device->pipe->texture_subdata(texture->device->pipe, texture->res,
+                                          texture->base_level + level,
                                           PIPE_MAP_WRITE, &box, bytes, row,
                                           row * box.height);
    return 0;
@@ -1985,8 +2294,8 @@ rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,
       return -1;
 
    struct pipe_transfer *xfer = NULL;
-   const uint8_t *map = pipe->texture_map(pipe, texture->res, level, PIPE_MAP_READ, &box,
-                                          &xfer);
+   const uint8_t *map = pipe->texture_map(pipe, texture->res, texture->base_level + level,
+                                          PIPE_MAP_READ, &box, &xfer);
    if (!map) {
       say(why, why_size, "the GPU driver would not map a %ux%u region of this texture for "
                          "the processor", box.width, box.height);
@@ -2079,8 +2388,8 @@ rwa_depth_read(struct rwa_texture *texture, unsigned level, unsigned layer,
    }
 
    struct pipe_transfer *xfer = NULL;
-   const uint8_t *map = pipe->texture_map(pipe, texture->res, level, PIPE_MAP_READ, &box,
-                                          &xfer);
+   const uint8_t *map = pipe->texture_map(pipe, texture->res, texture->base_level + level,
+                                          PIPE_MAP_READ, &box, &xfer);
    if (!map) {
       say(why, why_size, "the GPU driver would not map a %ux%u region of this %s texture "
                          "for the processor", box.width, box.height, texture->format_name);
@@ -2745,6 +3054,14 @@ buffer_offset_ok(const struct rwa_device *device, const struct air_resource *r,
                  const struct rwa_buffer *b, size_t offset, const char *name,
                  const char *what, char *why, size_t why_size)
 {
+   char direct[96];
+
+   /* (a direct argument passes no description: it is made here, on a refusal, and not per draw) */
+   if (!what && (offset > b->size || (r->kind == AIR_RESOURCE_DEVICE_BUFFER &&
+                                      offset % device->ssbo_offset_align != 0))) {
+      snprintf(direct, sizeof(direct), "buffer %u of %s", r->index, name);
+      what = direct;
+   }
    if (offset > b->size) {
       say(why, why_size, "%s is bound at offset %zu of a buffer that holds %zu bytes",
           what, offset, b->size);
@@ -3219,6 +3536,7 @@ rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
                       &compute->caps.argbuf_mask, why, why_size) != 0)
       goto fail;
 
+   compute->caps.null_query_textures = compute->info.null_query_textures;
    if (info)
       *info = compute->caps;
    return compute;
@@ -3542,7 +3860,7 @@ texture_fits(const struct rwa_texture *t, const struct rwa_slot *s, const char *
     * wrongness this port refuses on principle, and the hardware will not say no, so the
     * library does.
     */
-   if (s->shadow && !format_is_depth_stencil(t->res->format)) {
+   if (s->shadow && !format_is_depth_stencil(t->format)) {
       say(why, why_size, "%s samples texture %u with a comparison and the texture bound "
                          "there is %s, which is a colour format: Metal declares "
                          "sample_compare on depth2d alone, and this GPU answers a "
@@ -3577,8 +3895,8 @@ texture_fits(const struct rwa_texture *t, const struct rwa_slot *s, const char *
     * slot_element's -- shared with the query so that what a caller is told to bind and
     * what it is refused for cannot be two different things.
     */
-   nir_alu_type want = util_format_is_pure_uint(t->res->format) ? nir_type_uint
-                     : util_format_is_pure_sint(t->res->format) ? nir_type_int
+   nir_alu_type want = util_format_is_pure_uint(t->format) ? nir_type_uint
+                     : util_format_is_pure_sint(t->format) ? nir_type_int
                                                                 : nir_type_float;
    nir_alu_type have;
    const char *have_word;
@@ -3715,13 +4033,10 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
              * into one allocation and moves the offset per draw is the ordinary case,
              * and the window server of this port does it 55 times a boot.
              */
-            char what[96];
-
             if (direct_buffer_offset(r, bindings, table, table_count, name, &moffset, why,
                                      why_size) != 0)
                return -1;
-            snprintf(what, sizeof(what), "buffer %u of %s", r->index, name);
-            if (buffer_offset_ok(b->device, r, b, moffset, name, what, why, why_size) != 0)
+            if (buffer_offset_ok(b->device, r, b, moffset, name, NULL, why, why_size) != 0)
                return -1;
          }
          /* `r->size` is air.buffer_size, which a member never carries: the frontend
@@ -3750,6 +4065,9 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
          }
          if (!member && (r->index >= bindings->texture_count ||
                          !bindings->textures[r->index])) {
+            /* is_null_texture asks about this slot: empty is an answer, not an error */
+            if (info->null_query_textures & (1u << r->index))
+               break;
             say(why, why_size, "%s %s texture %u and %u texture%s bound", name,
                 stored ? "writes" : "reads", r->index, bindings->texture_count,
                 bindings->texture_count == 1 ? " was" : "s were");
@@ -3819,6 +4137,98 @@ struct rwa_bound {
 };
 
 /*
+ * The placeholder bound at an is_null_texture slot the caller left empty (struct rwa_device):
+ * the slot's declared shape and element type, one texel of zeros, made once per shape. A
+ * multisample slot is refused by name: a placeholder would need a multisample resource,
+ * which this GPU cannot fill. `stored` asks for one an image can be bound to; `res`, if
+ * given, receives the resource.
+ */
+static struct pipe_sampler_view *
+placeholder_view(struct rwa_device *device, const struct rwa_slot *slot, bool stored,
+                 struct pipe_resource **res, const char *name, unsigned index, char *why,
+                 size_t why_size)
+{
+   enum glsl_sampler_dim dim = slot->shape_known ? slot->dim : GLSL_SAMPLER_DIM_2D;
+   bool array = slot->shape_known && slot->is_array;
+   nir_alu_type type = slot->type_known ? slot->type : slot->declared_type;
+   enum pipe_texture_target target;
+
+   switch (dim) {
+   case GLSL_SAMPLER_DIM_1D: target = array ? PIPE_TEXTURE_1D_ARRAY : PIPE_TEXTURE_1D; break;
+   case GLSL_SAMPLER_DIM_3D: target = PIPE_TEXTURE_3D; break;
+   case GLSL_SAMPLER_DIM_CUBE: target = array ? PIPE_TEXTURE_CUBE_ARRAY : PIPE_TEXTURE_CUBE; break;
+   case GLSL_SAMPLER_DIM_2D: target = array ? PIPE_TEXTURE_2D_ARRAY : PIPE_TEXTURE_2D; break;
+   default:
+      say(why, why_size, "%s asks is_null_texture about texture %u, which is left empty, and "
+                         "its shape (a multisample or buffer texture) has no placeholder here",
+          name, index);
+      return NULL;
+   }
+   enum pipe_format format = slot->shadow ? PIPE_FORMAT_Z32_FLOAT
+                           : type == nir_type_uint ? PIPE_FORMAT_R32G32B32A32_UINT
+                           : type == nir_type_int ? PIPE_FORMAT_R32G32B32A32_SINT
+                                                  : PIPE_FORMAT_R32G32B32A32_FLOAT;
+
+   for (unsigned i = 0; i < device->placeholders; i++) {
+      if (device->placeholder[i].target == target && device->placeholder[i].format == format &&
+          (!stored || (device->placeholder[i].res->bind & PIPE_BIND_SHADER_IMAGE))) {
+         if (res)
+            *res = device->placeholder[i].res;
+         return device->placeholder[i].view;
+      }
+   }
+   if (device->placeholders == ARRAY_SIZE(device->placeholder)) {
+      say(why, why_size, "%s leaves texture %u empty and the %u placeholder shapes are all "
+                         "taken", name, index, (unsigned)ARRAY_SIZE(device->placeholder));
+      return NULL;
+   }
+   unsigned bind = PIPE_BIND_SAMPLER_VIEW | (stored ? PIPE_BIND_SHADER_IMAGE : 0);
+   unsigned layers = target == PIPE_TEXTURE_CUBE || target == PIPE_TEXTURE_CUBE_ARRAY ? 6 : 1;
+   if (!device->screen->is_format_supported(device->screen, format, target, 0, 0, bind)) {
+      say(why, why_size, "%s leaves texture %u empty and %s cannot make the placeholder "
+                         "(%s)", name, index, rwa_device_name(device),
+          util_format_name(format));
+      return NULL;
+   }
+   struct pipe_resource templ = {
+      .target = target, .format = format, .width0 = 1, .height0 = 1, .depth0 = 1,
+      .array_size = layers, .bind = bind, .usage = PIPE_USAGE_DEFAULT };
+   struct pipe_resource *pres = device->screen->resource_create(device->screen, &templ);
+   if (!pres) {
+      say(why, why_size, "%s leaves texture %u empty and the placeholder would not allocate",
+          name, index);
+      return NULL;
+   }
+   static const uint32_t zeros[4] = { 0 };
+   for (unsigned l = 0; l < layers; l++) {
+      struct pipe_box box = { .width = 1, .height = 1, .depth = 1 };
+      if (target == PIPE_TEXTURE_1D_ARRAY)
+         box.y = l;
+      else
+         box.z = l;
+      device->pipe->texture_subdata(device->pipe, pres, 0, PIPE_MAP_WRITE, &box, zeros,
+                                    sizeof(zeros), sizeof(zeros));
+   }
+   struct pipe_sampler_view tmpl = { 0 };
+   u_sampler_view_default_template(&tmpl, pres, format);
+   struct pipe_sampler_view *view = device->pipe->create_sampler_view(device->pipe, pres, &tmpl);
+   if (!view) {
+      pipe_resource_reference(&pres, NULL);
+      say(why, why_size, "%s leaves texture %u empty and the placeholder's view would not "
+                         "make", name, index);
+      return NULL;
+   }
+   unsigned n = device->placeholders++;
+   device->placeholder[n].target = target;
+   device->placeholder[n].format = format;
+   device->placeholder[n].res = pres;
+   device->placeholder[n].view = view;
+   if (res)
+      *res = pres;
+   return view;
+}
+
+/*
  * Bind one stage's resources, each as the kind its own instructions ask for, and record
  * what was bound. This is air_run's compute binding with the shader stage lifted out of
  * it, so the dispatch and a draw's fragment stage share it rather than keep two copies
@@ -3833,8 +4243,8 @@ struct rwa_bound {
  */
 static int
 bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
-           const struct air_shader_info *info, const unsigned *ubo_extent, void **own_sampler,
-           const bool *compare_sampler,
+           const struct air_shader_info *info, const struct rwa_slot *slots,
+           const unsigned *ubo_extent, void **own_sampler, const bool *compare_sampler,
            const struct rwa_bindings *bindings, const struct rwa_buffer_bind *table,
            unsigned table_count, const char *name, struct rwa_bound *bound, char *why,
            size_t why_size)
@@ -3859,6 +4269,7 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
    struct pipe_image_view images[RWA_MAX_TEXTURES] = { 0 };
    void *samplers[RWA_MAX_TEXTURES] = { 0 };
    unsigned num_views = 0, num_images = 0, num_samplers = 0;
+   uint32_t bound_slots = 0;   /* the textures bound, for is_null_texture */
 
    for (unsigned i = 0; i < info->num_resources; i++) {
       const struct air_resource *r = &info->resources[i];
@@ -3985,6 +4396,8 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
             if (*p) {
                memcpy(*p, (const char *)b->map + boffset, left);
                memset(*p + left, 0, can_read - left);
+               p_atomic_inc(&rwa_ubo_copied);
+               p_atomic_add(&rwa_ubo_copied_bytes, (uint64_t)can_read);
                cb.buffer = NULL;
                cb.user_buffer = *p;
                cb.buffer_offset = 0;
@@ -3994,18 +4407,26 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
             }
          }
          /*
-          * Slot 0 always as a user buffer. Panfrost may push any constant-offset read of UBO 0
-          * into the shader's FAU registers (pan_shader.c: pushable_ubos = bit 0), and the code
-          * that fills them copies from cb->user_buffer only -- "only user buffers use this
-          * path", an assert that release builds drop. A real buffer in slot 0 made it read
-          * from NULL: at offset 0 the UBO table came back as address 0 and the GPU faulted
-          * reading it (chronod's widgets, every boot), at another offset the window server
-          * died in memcpy at 0xc5 (25 October). OpenGL never meets it because st/mesa's
-          * uniforms are a user buffer. The Metal buffer is mapped for its whole life, so the
-          * pointer is the mapping, read at the draw.
+          * Slot 0 needs a user buffer: Panfrost may push any constant-offset read of UBO 0 into
+          * the shader's FAU registers (pan_shader.c: pushable_ubos = bit 0), and the code that
+          * fills them copies from cb->user_buffer only. A real buffer alone in slot 0 made it
+          * read from NULL (chronod's widgets faulted; the window server died in memcpy at 0xc5,
+          * 25 October). The Metal buffer is mapped for its whole life, so the pointer is the
+          * mapping.
+          *
+          * At an offset the GPU can fetch from, slot 0 gets the buffer itself for the GPU AND
+          * its mapping for the pushed words: panfrost_map_constant_buffer_gpu takes the resource
+          * when there is one, so nothing is uploaded, and panfrost_emit_const_buf reads the
+          * pushed words from user_buffer + buffer_offset. A user buffer alone is uploaded whole
+          * at every draw -- 64 KB a stage where the shader's extent is not known, 48% of the
+          * window server's time on a still lock screen, in memmove under
+          * panfrost_emit_const_buf (27 October, idle profile).
           */
-         if (boffset % device->ubo_offset_align == 0 && r->index != 0) {
+         if (boffset % device->ubo_offset_align == 0) {
             cb.buffer = b->res;
+            if (r->index == 0)
+               cb.user_buffer = b->map;
+            p_atomic_inc(&rwa_ubo_direct);
          } else {
             /* what is really there (up to Gallium's 64 KB), not air.buffer_size: a shader may
              * read past the size its metadata declares, and Panfrost bounds its pushed words
@@ -4015,18 +4436,39 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
             cb.user_buffer = (const char *)b->map + boffset;
             cb.buffer_offset = 0;
             cb.buffer_size = (unsigned)want;
+            p_atomic_inc(&rwa_ubo_copied);
+            p_atomic_add(&rwa_ubo_copied_bytes, (uint64_t)want);
          }
          pipe->set_constant_buffer(pipe, stage, r->index, false, &cb);
          break;
       }
 
       case AIR_RESOURCE_TEXTURE:
+         if (!t) {
+            /* only an is_null_texture slot gets here empty (check_bindings) */
+            struct pipe_sampler_view *pv = placeholder_view(device, &slots[r->index], false,
+                                                            NULL, name, r->index, why, why_size);
+            if (!pv)
+               return -1;
+            views[r->index] = pv;
+            num_views = MAX2(num_views, r->index + 1);
+            break;
+         }
+         bound_slots |= 1u << r->index;
          /* The view is made once and kept with the texture: a device has one context,
           * so a view of this texture is a view for every pipeline that will sample it.
           */
          if (!t->view) {
             struct pipe_sampler_view tmpl = { 0 };
-            u_sampler_view_default_template(&tmpl, t->res, t->res->format);
+            u_sampler_view_default_template(&tmpl, t->res, t->format);
+            /* the texture's window onto its resource (all of it unless it is a view) */
+            tmpl.target = t->target;
+            tmpl.u.tex.first_level = t->base_level;
+            tmpl.u.tex.last_level = t->base_level + t->levels - 1;
+            if (t->target != PIPE_TEXTURE_3D) {
+               tmpl.u.tex.first_layer = t->base_layer;
+               tmpl.u.tex.last_layer = t->base_layer + t->layers - 1;
+            }
             t->view = pipe->create_sampler_view(pipe, t->res, &tmpl);
             if (!t->view) {
                say(why, why_size, "%s would not make a sampler view of the %s bound at "
@@ -4040,9 +4482,24 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
          break;
 
       case AIR_RESOURCE_IMAGE:
+         if (!t) {
+            struct pipe_resource *pres = NULL;
+            if (!placeholder_view(device, &slots[r->index], true, &pres, name, r->index, why,
+                                  why_size))
+               return -1;
+            images[r->index] = (struct pipe_image_view){
+               .resource = pres, .format = pres->format,
+               .access = PIPE_IMAGE_ACCESS_READ_WRITE,
+               .shader_access = PIPE_IMAGE_ACCESS_READ_WRITE,
+               .u.tex.last_layer = pres->array_size - 1,
+            };
+            num_images = MAX2(num_images, r->index + 1);
+            break;
+         }
+         bound_slots |= 1u << r->index;
          images[r->index] = (struct pipe_image_view){
             .resource = t->res,
-            .format = t->res->format,
+            .format = t->format,
             /* what the shader does with it, from the metadata rather than assumed: a
              * read-write image told it is write-only reads zeros on some drivers.
              */
@@ -4050,10 +4507,11 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
                       (r->write ? PIPE_IMAGE_ACCESS_WRITE : 0),
             .shader_access = (r->read ? PIPE_IMAGE_ACCESS_READ : 0) |
                              (r->write ? PIPE_IMAGE_ACCESS_WRITE : 0),
-            .u.tex.level = 0,
-            .u.tex.first_layer = 0,
-            .u.tex.last_layer = (t->shape.type == RWA_TYPE_3D ? t->res->depth0
-                                                              : t->layers) - 1,
+            .u.tex.level = t->base_level,
+            .u.tex.first_layer = t->shape.type == RWA_TYPE_3D ? 0 : t->base_layer,
+            .u.tex.last_layer = t->shape.type == RWA_TYPE_3D
+                                   ? u_minify(t->res->depth0, t->base_level) - 1
+                                   : t->base_layer + t->layers - 1,
          };
          num_images = MAX2(num_images, r->index + 1);
          break;
@@ -4134,6 +4592,15 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
       num_samplers = MAX2(num_samplers, i + 1);
    }
 
+   if (info->null_query_ubo) {
+      /* is_null_texture's word: the slots bound just now (struct rwa_device) */
+      device->null_query_word[stage][0] = bound_slots;
+      struct pipe_constant_buffer word = {
+         .user_buffer = device->null_query_word[stage],
+         .buffer_size = sizeof(device->null_query_word[stage]),
+      };
+      pipe->set_constant_buffer(pipe, stage, info->null_query_ubo - 1, false, &word);
+   }
    if (num_ssbo)
       pipe->set_shader_buffers(pipe, stage, 0, num_ssbo, sb, writable);
    if (num_views)
@@ -4252,7 +4719,8 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
     * the next dispatch or dropped at delete, as before.
     */
    struct rwa_bound bound = { 0 };
-   if (bind_stage(device, PIPE_SHADER_COMPUTE, &compute->info, compute->ubo_extent, compute->own_sampler,
+   if (bind_stage(device, PIPE_SHADER_COMPUTE, &compute->info, compute->slots, compute->ubo_extent,
+                  compute->own_sampler,
                   compute->compare_sampler,
                   bindings, table, table_count, name, &bound, why, why_size) != 0)
       return -1;
@@ -5576,9 +6044,12 @@ rwa_texture_copy(struct rwa_texture *dst, unsigned dst_level, unsigned dst_slice
       return -1;
    struct pipe_context *pipe = src->device->pipe;
    struct pipe_screen *screen = src->device->screen;
-   enum pipe_format f = src->res->format;
+   enum pipe_format f = src->format;
 
-   if (f == dst->res->format && util_format_get_num_planes(f) == 1 &&
+   /* the resources' levels from here (texture_box has put the slices into the boxes) */
+   src_level += src->base_level;
+   dst_level += dst->base_level;
+   if (f == dst->format && util_format_get_num_planes(f) == 1 &&
        !util_format_is_depth_or_stencil(f) &&
        screen->is_format_supported(screen, f, dst->res->target, dst->res->nr_samples,
                                    dst->res->nr_storage_samples, PIPE_BIND_RENDER_TARGET) &&
@@ -5593,7 +6064,7 @@ rwa_texture_copy(struct rwa_texture *dst, unsigned dst_level, unsigned dst_slice
       pipe->blit(pipe, &blit);
       return 0;
    }
-   if (util_format_get_blocksize(f) != util_format_get_blocksize(dst->res->format)) {
+   if (util_format_get_blocksize(f) != util_format_get_blocksize(dst->format)) {
       say(why, why_size, "a copy from %s to %s, whose texels are not the same size",
           src->format_name, dst->format_name);
       return -1;
@@ -5642,13 +6113,16 @@ int
 rwa_texture_mipmaps(struct rwa_texture *texture, char *why, size_t why_size)
 {
    RWA_GUARD();
-   if (!texture || texture->res->last_level == 0)
+   if (!texture || texture->levels <= 1)
       return 0;
    struct pipe_context *pipe = texture->device->pipe;
-   unsigned last_layer = texture->res->target == PIPE_TEXTURE_3D ? 0 : texture->layers - 1;
+   bool volume = texture->res->target == PIPE_TEXTURE_3D;
+   unsigned first_layer = volume ? 0 : texture->base_layer;
+   unsigned last_layer = volume ? 0 : texture->base_layer + texture->layers - 1;
 
-   if (!pipe->generate_mipmap(pipe, texture->res, texture->res->format, 0,
-                              texture->res->last_level, 0, last_layer)) {
+   if (!pipe->generate_mipmap(pipe, texture->res, texture->format, texture->base_level,
+                              texture->base_level + texture->levels - 1, first_layer,
+                              last_layer)) {
       say(why, why_size, "%s would not make the mipmaps of a %s", rwa_device_name(texture->device),
           texture->format_name);
       return -1;
@@ -5759,7 +6233,7 @@ link_varyings_by_name(nir_shader *fs, const struct air_shader_info *finfo,
 
 /* The texture's render surface, made once (see struct rwa_texture). */
 static struct pipe_surface *
-texture_surface(struct rwa_device *device, struct rwa_texture *t);
+texture_surface(struct rwa_device *device, struct rwa_texture *t, unsigned level, unsigned layer);
 
 /*
  * Each colour attachment's own load action (rwa_draw.clear_color_mask): one Gallium clear per
@@ -5782,15 +6256,76 @@ clear_each_attachment(struct pipe_context *pipe, const struct rwa_draw *draw)
    }
 }
 
-/* The texture's render surface, made once (see struct rwa_texture). */
+/* The texture's render surface at a level and slice, made once each (see struct rwa_texture). */
 static struct pipe_surface *
-texture_surface(struct rwa_device *device, struct rwa_texture *t)
+texture_surface(struct rwa_device *device, struct rwa_texture *t, unsigned level, unsigned layer)
 {
-   if (!t->surface)
-      t->surface = device->pipe->create_surface(device->pipe, t->res,
-         &(struct pipe_surface){ .format = t->res->format });
-   return t->surface;
+   level += t->base_level;
+   layer += t->base_layer;
+   if (level == 0 && layer == 0) {
+      if (!t->surface)
+         t->surface = device->pipe->create_surface(device->pipe, t->res,
+            &(struct pipe_surface){ .format = t->format });
+      return t->surface;
+   }
+   for (unsigned i = 0; i < t->others; i++) {
+      if (t->other[i].level == level && t->other[i].layer == layer)
+         return t->other[i].surface;
+   }
+   struct pipe_surface *s = device->pipe->create_surface(device->pipe, t->res,
+      &(struct pipe_surface){ .format = t->format, .u.tex.level = level,
+                              .u.tex.first_layer = layer, .u.tex.last_layer = layer });
+   if (s) {
+      /* eight kept per texture; past that the oldest is let go (a pending batch holds its own
+       * reference), which costs only Panfrost's batching by pointer for that one */
+      unsigned slot = t->others < ARRAY_SIZE(t->other) ? t->others++ : t->next_other++ % ARRAY_SIZE(t->other);
+
+      pipe_surface_reference(&t->other[slot].surface, NULL);
+      t->other[slot].level = level;
+      t->other[slot].layer = layer;
+      t->other[slot].surface = s;
+   }
+   return s;
 }
+
+/* "colour attachment N", or "the depth attachment" for -1: made only for a refusal, never per draw */
+static const char *
+attachment_name(char *buf, size_t size, int index)
+{
+   if (index < 0)
+      return "the depth attachment";
+   snprintf(buf, size, "colour attachment %d", index);
+   return buf;
+}
+
+/* An attachment's level and slice (rwa_draw.color_level/color_layer, depth_level/depth_layer), and
+ * whether the texture has them; `w`/`h` are the level's size. `index`: the colour attachment, or -1. */
+static bool
+attachment_level(const struct rwa_texture *t, unsigned level, unsigned layer, int index,
+                 unsigned *w, unsigned *h, char *why, size_t why_size)
+{
+   unsigned layers = t->shape.type == RWA_TYPE_3D
+                        ? u_minify(t->res->depth0, t->base_level + level) : t->layers;
+   char what[32];
+
+   if (level >= t->levels) {
+      attachment_name(what, sizeof(what), index);
+      say(why, why_size, "%s is drawn into level %u of a texture of %u level%s", what, level,
+          t->levels, t->levels > 1 ? "s" : "");
+      return false;
+   }
+   if (layer >= MAX2(layers, 1)) {
+      attachment_name(what, sizeof(what), index);
+      say(why, why_size, "%s is drawn into slice %u of a texture of %u", what, layer, MAX2(layers, 1));
+      return false;
+   }
+   *w = u_minify(t->shape.width, level);
+   *h = u_minify(t->shape.height ? t->shape.height : 1, level);
+   return true;
+}
+
+#define DRAW_LEVEL(d, i) ((d)->color_level ? (d)->color_level[i] : 0)
+#define DRAW_LAYER(d, i) ((d)->color_layer ? (d)->color_layer[i] : 0)
 
 /*
  * A [[depth]] (or [[stencil]]) output with no depth attachment to take it: Metal discards the
@@ -7191,11 +7726,13 @@ rwa_render_destroy(struct rwa_render *render)
  * mismatch would silently become whatever the first attachment happened to be.
  */
 static bool
-attachment_shape_fits(const struct rwa_texture *t, unsigned samples, const char *what,
+attachment_shape_fits(const struct rwa_texture *t, unsigned samples, int index,
                       char *why, size_t why_size)
 {
    unsigned want_type = samples > 1 ? RWA_TYPE_2D_MULTISAMPLE : RWA_TYPE_2D;
+   char what[32];
    if (t->shape.type != want_type) {
+      attachment_name(what, sizeof(what), index);
       say(why, why_size, "%s is a %s and a pass of %u sample%s per pixel renders into a %s",
           what, texture_type_name(t->shape.type), samples, samples == 1 ? "" : "s",
           texture_type_name(want_type));
@@ -7203,6 +7740,7 @@ attachment_shape_fits(const struct rwa_texture *t, unsigned samples, const char 
    }
    unsigned have = t->res->nr_samples > 1 ? t->res->nr_samples : 1;
    if (have != samples) {
+      attachment_name(what, sizeof(what), index);
       say(why, why_size, "%s has %u sample%s per pixel and the pipeline was made for %u",
           what, have, have == 1 ? "" : "s", samples);
       return false;
@@ -7420,13 +7958,11 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    unsigned w = 0, h = 0;
    for (unsigned i = 0; i < draw->color_count; i++) {
       struct rwa_texture *t = draw->color ? draw->color[i] : NULL;
-      char what[48];
       if (!t) {
          say(why, why_size, "colour attachment %u is not a texture", i);
          return -1;
       }
-      snprintf(what, sizeof(what), "colour attachment %u", i);
-      if (!attachment_shape_fits(t, samples, what, why, why_size))
+      if (!attachment_shape_fits(t, samples, (int)i, why, why_size))
          return -1;
       if (!(t->res->bind & PIPE_BIND_RENDER_TARGET)) {
          say(why, why_size, "colour attachment %u (%s) was made without "
@@ -7439,16 +7975,15 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
              render->shape.color_format[i]);
          return -1;
       }
-      unsigned tw = t->shape.width;
-      unsigned th = t->shape.height ? t->shape.height : 1;
-      if (i == 0) {
-         w = tw;
-         h = th;
-      } else if (tw != w || th != h) {
-         say(why, why_size, "colour attachment %u is %ux%u and attachment 0 is %ux%u", i,
-             tw, th, w, h);
+      unsigned tw, th;
+      if (!attachment_level(t, DRAW_LEVEL(draw, i), DRAW_LAYER(draw, i), (int)i, &tw, &th, why,
+                            why_size))
          return -1;
-      }
+      /* Attachments of different sizes are legal in Metal: the pass covers the area they all
+       * have, the smallest (MTLRenderPassDescriptor renderTargetWidth/Height, left 0). CoreAnimation
+       * draws a blur level into level 1 of one texture beside level 0 of another (27 October). */
+      w = i == 0 ? tw : MIN2(w, tw);
+      h = i == 0 ? th : MIN2(h, th);
    }
 
    /* The depth/stencil attachment, by the same checks and one more: it is the only
@@ -7458,7 +7993,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     */
    if (draw->depth) {
       struct rwa_texture *t = draw->depth;
-      if (!attachment_shape_fits(t, samples, "the depth attachment", why, why_size))
+      if (!attachment_shape_fits(t, samples, -1, why, why_size))
          return -1;
       if (!format_is_depth_stencil(t->res->format)) {
          say(why, why_size, "the depth attachment is %s, which is a colour format",
@@ -7476,16 +8011,12 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
                             "could be drawn into", t->format_name);
          return -1;
       }
-      unsigned tw = t->shape.width;
-      unsigned th = t->shape.height ? t->shape.height : 1;
-      if (draw->color_count == 0) {
-         w = tw;        /* a depth-only pass: the depth attachment is the pass's size */
-         h = th;
-      } else if (tw != w || th != h) {
-         say(why, why_size, "the depth attachment is %ux%u and colour attachment 0 is %ux%u",
-             tw, th, w, h);
+      unsigned tw, th;
+      if (!attachment_level(t, draw->depth_level, draw->depth_layer, -1, &tw, &th, why, why_size))
          return -1;
-      }
+      /* (a depth-only pass is the depth attachment's size; otherwise the smallest, as above) */
+      w = draw->color_count == 0 ? tw : MIN2(w, tw);
+      h = draw->color_count == 0 ? th : MIN2(h, th);
    }
 
 
@@ -7519,7 +8050,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
                                         .nr_cbufs = draw->color_count,
                                         .samples = samples };
    for (unsigned i = 0; i < draw->color_count; i++) {
-      surf[i] = texture_surface(device, draw->color[i]);
+      surf[i] = texture_surface(device, draw->color[i], DRAW_LEVEL(draw, i), DRAW_LAYER(draw, i));
       if (!surf[i]) {
          say(why, why_size, "%s would not make a render surface of colour attachment %u",
              rwa_device_name(device), i);
@@ -7528,7 +8059,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       fb.cbufs[i] = surf[i];
    }
    if (draw->depth) {
-      zsurf = texture_surface(device, draw->depth);
+      zsurf = texture_surface(device, draw->depth, draw->depth_level, draw->depth_layer);
       if (!zsurf) {
          say(why, why_size, "%s would not make a render surface of the depth attachment",
              rwa_device_name(device));
@@ -7657,13 +8188,15 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 
    struct rwa_bound fbound = { 0 }, vbound = { 0 };
    int rc = -1;
-   if (bind_stage(device, PIPE_SHADER_FRAGMENT, &render->finfo, render->fs_ubo_extent, render->frag_own_sampler,
+   if (bind_stage(device, PIPE_SHADER_FRAGMENT, &render->finfo, render->frag_slots,
+                  render->fs_ubo_extent, render->frag_own_sampler,
                   render->frag_compare_sampler,
                   &draw->fragment, draw->fragment_buffer_table, draw->fragment_buffer_table_count,
                   fname, &fbound, why, why_size) != 0)
       goto unbind;
    if (!render->generated_vertex &&
-       bind_stage(device, PIPE_SHADER_VERTEX, &render->vinfo, render->vs_ubo_extent, render->vert_own_sampler,
+       bind_stage(device, PIPE_SHADER_VERTEX, &render->vinfo, render->vert_slots,
+                  render->vs_ubo_extent, render->vert_own_sampler,
                   render->vert_compare_sampler,
                   &draw->vertex, draw->vertex_buffer_table, draw->vertex_buffer_table_count, vname,
                   &vbound, why, why_size) != 0)
@@ -7792,29 +8325,41 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_draw *draw, char *w
       return -1;
    }
    for (unsigned i = 0; i < draw->color_count; i++) {
+      unsigned tw, th;
+
       if (!draw->color[i])
          continue;
-      fb.cbufs[i] = texture_surface(device, draw->color[i]);
+      if (!attachment_level(draw->color[i], DRAW_LEVEL(draw, i), DRAW_LAYER(draw, i), (int)i, &tw, &th,
+                            why, why_size))
+         return -1;
+      fb.cbufs[i] = texture_surface(device, draw->color[i], DRAW_LEVEL(draw, i), DRAW_LAYER(draw, i));
       if (!fb.cbufs[i]) {
          say(why, why_size, "%s would not make a render surface of colour attachment %u",
              rwa_device_name(device), i);
          return -1;
       }
-      w = draw->color[i]->res->width0;
-      h = draw->color[i]->res->height0;
+      w = w ? MIN2(w, tw) : tw;       /* the smallest attachment, as for a draw */
+      h = h ? MIN2(h, th) : th;
       samples = MAX2(draw->color[i]->res->nr_samples, 1);
    }
    if (draw->depth) {
-      fb.zsbuf = texture_surface(device, draw->depth);
+      unsigned tw, th;
+
+      if (!attachment_level(draw->depth, draw->depth_level, draw->depth_layer, -1, &tw, &th, why, why_size))
+         return -1;
+      fb.zsbuf = texture_surface(device, draw->depth, draw->depth_level, draw->depth_layer);
       if (!fb.zsbuf) {
          say(why, why_size, "%s would not make a render surface of the depth attachment",
              rwa_device_name(device));
          return -1;
       }
       if (!w) {
-         w = draw->depth->res->width0;
-         h = draw->depth->res->height0;
+         w = tw;
+         h = th;
          samples = MAX2(draw->depth->res->nr_samples, 1);
+      } else {
+         w = MIN2(w, tw);
+         h = MIN2(h, th);
       }
    }
    if (!w || !h) {

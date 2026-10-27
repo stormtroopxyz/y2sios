@@ -6,7 +6,12 @@ profiler, com.redwood.metal.prof). The library on the phone has its local symbol
 the same layout and names them. Also adds up the samples by function, which the profiler could
 not do for this library.
 
-    tools/prof-symbolize.py xnulog.txt [unstripped libredwoodair.dylib]
+    tools/prof-symbolize.py RUN [unstripped libredwoodair.dylib]
+
+RUN is a console log or a mali2metal run (logs/m2m/*.m2m). From the `prof: airstack` records (each a count
+and the library's frames of the samples, innermost first, and `out:<image>` where the pc was outside it),
+it also gives every library function's INCLUSIVE samples (time in it and in what it calls) and SELF
+samples, and for the busiest the callees that take its time: the tree of where a draw's time goes.
 """
 import bisect
 import glob
@@ -51,6 +56,9 @@ def main():
         i = bisect.bisect_right(addrs, off) - 1
         return names[i] if i >= 0 else '?'
 
+    stack_line = re.compile(r'prof: airstack (\d+)((?: (?:0x[0-9a-f]+|out:\S+))+)')
+    inclusive, self_, callees, outside = {}, {}, {}, {}
+    stacks_total = 0
     ref = re.compile(r'libredwoodair\.dylib\+0x([0-9a-f]+)')
     air_line = re.compile(r'prof: air 0x([0-9a-f]+) (\d+)')
     total = {}
@@ -58,12 +66,44 @@ def main():
         for line in f:
             if 'prof:' not in line and not line.startswith('    '):
                 continue
+            m = stack_line.search(line)
+            if m:
+                count = int(m.group(1))
+                frames = m.group(2).split()
+                out = frames[0][4:] if frames[0].startswith('out:') else None
+                chain = [fn(int(f, 16)) for f in frames if f.startswith('0x')]
+                stacks_total += count
+                for k in set(chain):
+                    inclusive[k] = inclusive.get(k, 0) + count
+                leaf = ('[%s]' % out) if out else chain[0]
+                if out:
+                    outside[chain[0]] = outside.get(chain[0], {})
+                    outside[chain[0]][out] = outside[chain[0]].get(out, 0) + count
+                else:
+                    self_[chain[0]] = self_.get(chain[0], 0) + count
+                # each caller -> its next callee (the leaf an outside image when the pc was there)
+                for i in range(len(chain) - 1, 0, -1):
+                    c = callees.setdefault(chain[i], {})
+                    c[chain[i - 1]] = c.get(chain[i - 1], 0) + count
+                if out:
+                    c = callees.setdefault(chain[0], {})
+                    c[leaf] = c.get(leaf, 0) + count
+                continue
             m = air_line.search(line)
             if m:
                 k = fn(int(m.group(1), 16))
                 total[k] = total.get(k, 0) + int(m.group(2))
                 continue
             print(ref.sub(lambda m: 'air:' + name(int(m.group(1), 16)), line.rstrip('\n')))
+    if inclusive:
+        print('\nlibredwoodair, inclusive (the function and what it calls) of %d samples in the library:' % stacks_total)
+        print('%7s %6s %7s  %s' % ('incl', '%', 'self', 'function'))
+        for k, v in sorted(inclusive.items(), key=lambda kv: -kv[1])[:40]:
+            print('%7d %5.1f%% %7d  %s' % (v, 100.0 * v / stacks_total, self_.get(k, 0), k))
+        print('\nwhere the busiest functions\' time goes (callees by samples; [image] = outside the library):')
+        for k, v in sorted(inclusive.items(), key=lambda kv: -kv[1])[:15]:
+            parts = sorted(callees.get(k, {}).items(), key=lambda kv: -kv[1])[:6]
+            print('  %-40s %6d: %s' % (k[:40], v, ', '.join('%s %d' % (c, n) for c, n in parts) or '(all self)'))
     if total:
         print('\nlibredwoodair by function (its own samples, from the `prof: air` lines):')
         for k, v in sorted(total.items(), key=lambda kv: -kv[1])[:30]:

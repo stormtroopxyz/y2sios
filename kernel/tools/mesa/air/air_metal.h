@@ -54,6 +54,10 @@ struct rwa_compute_info {
 	 * field a driver already fills keeps its offset.
 	 */
 	unsigned argbuf_mask;
+
+	/* The texture slots the shader asks is_null_texture about, one bit each: those it
+	 * may be dispatched with left empty. Appended, like argbuf_mask. */
+	unsigned null_query_textures;
 };
 
 /* The device. One per Metal device object; it owns the screen and one context.
@@ -61,6 +65,20 @@ struct rwa_compute_info {
  * ordinary case when the kernel was booted without gpu=1. */
 struct rwa_device *rwa_device_open(char *why, size_t why_size);
 void rwa_device_close(struct rwa_device *device);
+
+/*
+ * What the GPU driver's buffer cache has done since the process started (Panfrost's BO cache,
+ * tools/mesa/panfrost-retain.patch): out[0] hits, [1] misses (a new allocation in the kernel),
+ * [2] BOs evicted, [3] bytes evicted, [4] bytes cached now, [5] BOs cached now. -1 where the
+ * driver keeps no such counts.
+ */
+int rwa_gpu_cache_stats(uint64_t out[6]);
+
+/*
+ * Constant buffer bindings since the process started: out[0] given to the GPU as the buffer itself,
+ * [1] copied (a user buffer, which the driver uploads at every draw), [2] the bytes of those copies.
+ */
+int rwa_ubo_stats(uint64_t out[3]);
 
 /* What the driver should call the GPU, as Mesa knows it ("Adreno 7c+ Gen 3"). Never NULL. */
 const char *rwa_device_name(struct rwa_device *device);
@@ -139,6 +157,31 @@ struct rwa_texture *rwa_texture_create(struct rwa_device *device,
 				       const struct rwa_texture_shape *shape,
 				       char *why, size_t why_size);
 void rwa_texture_destroy(struct rwa_texture *texture);
+
+/*
+ * A texture over a buffer's memory, -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]: a linear 2D
+ * image of `shape` from byte `offset` with `row_bytes` a row, the same memory as the buffer (one GPU buffer
+ * object, not a copy). Refused by name as an import is: a 2D texture of one level and one slice, rows of at
+ * least the width and a multiple of 64 bytes, inside the buffer.
+ */
+struct rwa_texture *rwa_texture_from_buffer(struct rwa_buffer *buffer,
+					    const struct rwa_texture_shape *shape, size_t offset,
+					    size_t row_bytes, char *why, size_t why_size);
+
+/*
+ * A view: a second texture over `texture`'s memory (one more reference on the same
+ * resource), which is -newTextureViewWithPixelFormat:textureType:levels:slices:. It shows
+ * `levels` levels from `first_level` and `slices` slices from `first_slice`, both counted
+ * in `texture`'s own terms, as `pixel_format` and `type`. Metal's rules are Apple's
+ * documented ones and each is a refusal by name: the type casts of Apple's table, a colour
+ * format only as one of the same bit length, a depth or stencil format only as itself, 6
+ * slices for a cube and a multiple of 6 for a cube array. rwa_texture_destroy releases a
+ * view as it does a texture; the memory lives until the last of them is gone.
+ */
+struct rwa_texture *rwa_texture_view(struct rwa_texture *texture, unsigned pixel_format,
+				     unsigned type, unsigned first_level, unsigned levels,
+				     unsigned first_slice, unsigned slices, char *why,
+				     size_t why_size);
 
 /*
  * The same texture, over memory somebody else allocated: an IOSurface of CoreAnimation's.
@@ -1346,6 +1389,15 @@ struct rwa_draw {
 	 * level of its pyramid into its own corner of one texture; drawn over the whole of it, every
 	 * level overwrote the others (black bands on materials, a black Maps). */
 	const float *viewport;
+	/* appended (27 October): the mipmap level and the array slice (or 3D depth plane) each
+	 * attachment is drawn into, Metal's MTLRenderPassAttachmentDescriptor level/slice/depthPlane.
+	 * color_level and color_layer are NULL or color_count entries; NULL is level 0, slice 0 for
+	 * every colour attachment. CoreAnimation draws the levels of a blur pyramid into level 1 and
+	 * up (PLANS/10-mali2metal.md), and drawn into level 0 they overwrote the picture there. The
+	 * pass's size is the level's size. A level or slice the texture does not have is refused. */
+	const unsigned *color_level;
+	const unsigned *color_layer;
+	unsigned depth_level, depth_layer;
 };
 
 /* A pass that clears and draws nothing: the attachments, clear values and `deferred` of

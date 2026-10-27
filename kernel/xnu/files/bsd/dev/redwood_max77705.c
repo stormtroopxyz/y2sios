@@ -24,7 +24,7 @@
  *     0xD0 IIN        0.125 mA (input current)
  *   charger 0x69:
  *     0xB2 CHG_INT_OK bit 6 CHGIN_OK (wired power), bit 5 WCIN_OK (wireless), bit 2 BATP_OK
- *     0xB3 DETAILS_00 bits 6:5 CHGIN_DTLS (3: VBUS valid)
+ *     0xB3 DETAILS_00 bits 6:5 CHGIN_DTLS (3: VBUS valid), bits 4:3 WCIN_DTLS (3: valid)
  *     0xB4 DETAILS_01 bits 3:0 CHG_DTLS: 0-2 charging, 3-4 done, 5-7 not charging, 8/A/B off
  *
  * Boot args: bms=1 (on), bms_secs=N (poll period, default 5), bms_trace=1 (every reading).
@@ -37,6 +37,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/redwood_bbi2c.h>
 #include <sys/redwood_input.h>
+#include <sys/redwood_m2m.h>
 #include <sys/systm.h>
 
 #define BANK_GPP1               0x20U           /* PERIC0 */
@@ -63,6 +64,8 @@
 
 #define CHG_INT_OK_WCIN         (1U << 5)
 #define CHG_INT_OK_CHGIN        (1U << 6)
+#define CHG_CHGIN_DTLS(d00)     (((d00) >> 5) & 3U)     /* max77705_get_vbus_state(): 3 = VBUS valid */
+#define CHG_WCIN_DTLS(d00)      (((d00) >> 3) & 3U)
 
 #define FG_RESISTOR             2               /* fuelgauge,fg_resistor */
 #define DESIGN_MAH              4500            /* battery,battery_full_capacity */
@@ -148,7 +151,9 @@ poll_once(bool say)
 	if (!chg_byte(CHG_INT_OK, &int_ok) || !chg_byte(CHG_DETAILS_00, &d00) || !chg_byte(CHG_DETAILS_01, &d01)) {
 		return false;
 	}
-	external = (int_ok & (CHG_INT_OK_CHGIN | CHG_INT_OK_WCIN)) != 0;
+	/* a cable or a pad: its OK bit and its input valid, as Samsung's driver reads it (max77705_get_vbus_state) */
+	external = ((int_ok & CHG_INT_OK_CHGIN) && CHG_CHGIN_DTLS(d00) == 3) ||
+	    ((int_ok & CHG_INT_OK_WCIN) && CHG_WCIN_DTLS(d00) == 3);
 
 	/* the gauge's temperature is only real with a thermistor on it (Samsung reads one on the AP's ADC) */
 	temp_hundredths = (int32_t)(int16_t)temp * 100 / 256;
@@ -178,6 +183,18 @@ poll_once(bool say)
 		b.usb_current_ua = (int32_t)iin * 125;
 	}
 	redwood_battery_report(&b);
+	{
+		static int last_external = -1, last_status = -1;
+
+		if (b.external != last_external || b.status != last_status) {
+			m2m_klog('I', "DEV", "bms: %s, %s at %d.%02d %%: INT_OK %#x DETAILS_00 %#x DETAILS_01 %#x, input %d mV %d mA",
+			    external ? "on a charger" : "no charger", status_name(b.status), b.percent_hundredths / 100,
+			    b.percent_hundredths % 100, int_ok, d00, d01, (int)((uint64_t)vbyp * 427246 / 1000000),
+			    (int)iin * 125 / 1000);
+			last_external = b.external;
+			last_status = b.status;
+		}
+	}
 
 	if (say || trace) {
 		printf("bms: %d.%02d %% %d mV %d mA (now %d), %d.%02d C, %d/%d mAh (design %d, gauge %u), %u cycles, "
@@ -218,7 +235,8 @@ bms_thread(__unused void *parameter, __unused wait_result_t result)
 		if (poll_once(say)) {
 			failures = 0;
 		} else if (failures++ < 5) {
-			printf("bms: no answer from the MAX77705 (%u)\n", failures);
+			m2m_klog('W', "DEV", "bms: no answer from the MAX77705 (%u, %u stretched clocks given up on so far): the "
+			    "battery's state is not updated", failures, bus.stretch_timeouts);
 		}
 		delay_for_interval(secs, NSEC_PER_SEC);
 	}

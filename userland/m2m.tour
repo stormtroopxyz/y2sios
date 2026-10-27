@@ -1,0 +1,28 @@
+# mali2metal's standard tour (PLANS/10-mali2metal.md): installed as /redwood/etc/m2m.tour and run by rwlogd
+# on GET /tour (`./y2s.sh m2m tour`, and `./y2s.sh loop` after every boot) through /redwood/sbin/init, one
+# command a line. The same gestures every run, so that two runs' records can be compared step by step.
+# Each step is a MARK record; the Metal processes' totals (SUM) come at the end; "tour done" is what the host
+# waits for. Coordinates are fractions of the screen (rwtouch), as rc.jobs.metaldiag measured them.
+/redwood/bin/m2m_mark tour start
+/redwood/bin/rwtouch button home wait 2 swipe 0.5 0.985 0.5 0.3 200 wait 4 button home wait 3
+/redwood/bin/m2m_mark step 1/8 home screen, idle 5 s
+/redwood/bin/rwtouch wait 5
+/redwood/bin/m2m_mark step 2/8 home pages: swipe left, right, to the widgets page and back
+/redwood/bin/rwtouch swipe 0.85 0.5 0.15 0.5 250 wait 2 swipe 0.15 0.5 0.85 0.5 250 wait 2 swipe 0.15 0.5 0.85 0.5 250 wait 3 swipe 0.85 0.5 0.15 0.5 250 wait 2
+/redwood/bin/m2m_mark step 3/8 Search pulled down and dismissed
+/redwood/bin/rwtouch swipe 0.5 0.4 0.5 0.75 250 wait 3 button home wait 3
+/redwood/bin/m2m_mark step 4/8 Settings opened and scrolled
+/redwood/bin/rwtouch tap 0.615 0.71 wait 6 swipe 0.5 0.75 0.5 0.35 300 wait 3 swipe 0.5 0.35 0.5 0.75 300 wait 3 button home wait 3
+/redwood/bin/m2m_mark step 5/8 Safari: three pages opened in turn, each scrolled, then closed
+# (one page a line: init runs a line of at most 63 words)
+/redwood/bin/rwtouch notify com.redwood.open wait 12 swipe 0.5 0.75 0.5 0.3 300 wait 2 swipe 0.5 0.75 0.5 0.3 300 wait 2 swipe 0.5 0.3 0.5 0.75 300 wait 2
+/redwood/bin/rwtouch notify com.redwood.open wait 12 swipe 0.5 0.75 0.5 0.3 300 wait 2 swipe 0.5 0.75 0.5 0.3 300 wait 2 swipe 0.5 0.3 0.5 0.75 300 wait 2
+/redwood/bin/rwtouch notify com.redwood.open wait 12 swipe 0.5 0.75 0.5 0.3 300 wait 2 swipe 0.5 0.75 0.5 0.3 300 wait 2 swipe 0.5 0.3 0.5 0.75 300 wait 2 button home wait 3
+/redwood/bin/m2m_mark step 6/8 Control Centre opened and closed
+/redwood/bin/rwtouch swipe 0.9 0.005 0.9 0.6 300 wait 4 button home wait 3
+/redwood/bin/m2m_mark step 7/8 Notification Centre opened and closed
+/redwood/bin/rwtouch swipe 0.3 0.005 0.3 0.6 300 wait 4 button home wait 3
+/redwood/bin/m2m_mark step 8/8 totals asked of every Metal process
+/redwood/bin/rwtouch notify com.redwood.metal.summary wait 4
+/redwood/bin/mg_test statfs DiskUsage
+/redwood/bin/m2m_mark tour done

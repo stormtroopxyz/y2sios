@@ -38,9 +38,12 @@
 #include "MiniIOSurface.h"
 
 extern "C" {
+/* bsd/sys/redwood_m2m.h (not seen from here): mali2metal's channel */
+void m2m_klog_self(char sev, const char *cat, const char *fmt, ...) __printflike(3, 4);
 /* bsd/sys/redwood_mali.h (not seen from here) */
 #define REDWOOD_MALI_MAP_NOEXEC         0x1
 bool redwood_mali_ready(void);
+void redwood_mali_share_completed(volatile uint64_t *where);
 bool redwood_mali_param(uint32_t param, uint64_t *value);
 uint64_t redwood_mali_va_alloc(uint64_t size, bool exec);
 void redwood_mali_va_free(uint64_t va, uint64_t size);
@@ -92,6 +95,12 @@ struct drm_panfrost_submit {
 	uint64_t bo_handles;
 	uint32_t bo_handle_count, requirements;
 	uint32_t jm_ctx_handle, pad;            /* (newer than Mesa 25.0.7, which passes 48 bytes) */
+};
+/* SUBMIT as the port's libdrm sends it (tools/mesa/redwood-drm): Linux's request and, after it, where the
+ * job's sequence number is written back, so that the library can answer an idle query itself */
+struct redwood_mali_submit_ex {
+	struct drm_panfrost_submit submit;
+	uint64_t seqno;
 };
 struct drm_panfrost_wait_bo {
 	uint32_t handle, pad;
@@ -443,6 +452,7 @@ RedwoodMaliUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uin
 	}
 	if (b == NULL || (address = redwood_mali_va_alloc(size, !(mapFlags & REDWOOD_MALI_MAP_NOEXEC))) == 0) {
 		IOLog("RedwoodMali: no %s left for a buffer of %llu bytes\n", b ? "GPU addresses" : "handles", size);
+		m2m_klog_self('E', "RES", "gpu buffer of %llu bytes refused: no %s left", size, b ? "GPU addresses" : "handles");
 		return NULL;
 	}
 	for (uint64_t offset = 0; offset < size && mapped;) {
@@ -463,6 +473,7 @@ RedwoodMaliUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uin
 		redwood_mali_unmap(address, size);
 		redwood_mali_va_free(address, size);
 		IOLog("RedwoodMali: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
+		m2m_klog_self('E', "RES", "gpu buffer of %llu bytes refused: cannot be mapped into the GPU's address space", size);
 		return NULL;
 	}
 	bzero(b, sizeof(*b));
@@ -613,6 +624,8 @@ RedwoodMaliUserClient::createBo(struct drm_panfrost_create_bo * request)
 	if (memory == NULL) {
 		IOLog("RedwoodMali: no memory for a buffer of %llu bytes (%u buffers, %llu MB with this client)\n", size, fBufferCount,
 		    fBufferBytes >> 20);
+		m2m_klog_self('E', "RES", "gpu buffer of %llu bytes refused: no memory (%u buffers, %llu MB with this client)", size,
+		    fBufferCount, fBufferBytes >> 20);
 		return kIOReturnNoMemory;
 	}
 	IOLockLock(gMaliLock);
@@ -754,6 +767,9 @@ RedwoodMaliUserClient::submit(struct drm_panfrost_submit * request, size_t size)
 		if (request->out_sync != 0 && (out = syncobj(request->out_sync)) != NULL) {
 			*out = fence;
 		}
+		if (size >= sizeof(struct redwood_mali_submit_ex)) {
+			((struct redwood_mali_submit_ex *) request)->seqno = fence;
+		}
 	}
 	reap(false);
 	if (fSubmits++ < 4) {
@@ -804,6 +820,10 @@ RedwoodMaliUserClient::syncobjWait(struct drm_syncobj_wait * request)
 		absolutetime_to_nanoseconds(mach_absolute_time() - began, &now);
 		if (now / NSEC_PER_MSEC >= patience) {
 			static uint32_t told;
+
+			m2m_klog_self('W', "GPU", "fence wait gave up after %llu ms (patience %llu): %u fence(s), first %llu, last submitted %llu, "
+			    "first done %d", now / NSEC_PER_MSEC, patience, count, fences[0], redwood_mali_last(),
+			    (int) redwood_mali_done(fences[0]));
 
 			if (told++ < 16) {
 				char line[200];
@@ -872,6 +892,29 @@ RedwoodMaliUserClient::show(const struct redwood_show * request)
 	return ret;
 }
 
+/*
+ * Client memory type 0 (never a buffer's handle): one page every client may read, with the GPU's completed
+ * job count in its first 8 bytes (redwood_mali_share_completed). Made at the first request and kept.
+ */
+static IOBufferMemoryDescriptor * gMaliStatus;
+
+static IOMemoryDescriptor *
+statusPage(void)
+{
+	if (gMaliStatus == NULL) {
+		IOBufferMemoryDescriptor * page = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+		    kIODirectionInOut | kIOMemoryKernelUserShared, PAGE_SIZE, PAGE_SIZE);
+
+		if (page == NULL) {
+			return NULL;
+		}
+		bzero(page->getBytesNoCopy(), PAGE_SIZE);
+		gMaliStatus = page;
+		redwood_mali_share_completed((volatile uint64_t *) page->getBytesNoCopy());
+	}
+	return gMaliStatus;
+}
+
 IOReturn
 RedwoodMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory)
 {
@@ -879,6 +922,18 @@ RedwoodMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, 
 	IOReturn ret = kIOReturnBadArgument;
 
 	IOLockLock(gMaliLock);
+	if (type == 0) {
+		IOMemoryDescriptor * page = statusPage();
+
+		if (page != NULL) {
+			page->retain();
+			*memory = page;
+			*options = kIOMapReadOnly;
+			ret = kIOReturnSuccess;
+		}
+		IOLockUnlock(gMaliLock);
+		return ret;
+	}
 	b = buffer(type);
 	if (b != NULL) {
 		b->memory->retain();
@@ -897,6 +952,7 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 {
 	union {
 		struct drm_panfrost_submit submit;
+		struct redwood_mali_submit_ex submitEx;
 		struct drm_panfrost_wait_bo waitBo;
 		struct drm_panfrost_create_bo createBo;
 		struct drm_panfrost_mmap_bo mmapBo;

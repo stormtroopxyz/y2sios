@@ -31,6 +31,98 @@ static io_connect_t connection;
 static int connection_fd = -1;
 static int panfrost;                    /* the connection is RedwoodMali's */
 
+/*
+ * PANFROST'S IDLE QUERY, ANSWERED HERE (PLANS/10-mali2metal.md, item 2 B).
+ *
+ * Panfrost asks WAIT_BO with a deadline already past ("is it idle?") of every buffer it takes from its
+ * cache -- each new batch's descriptor pools -- and on this kernel every ask is an IOKit round trip
+ * (run 6's profile: ~9 % of the compiler library's time). The answer is two numbers the kernel already
+ * has: the buffer's last job and the GPU's completed count. RedwoodMali shares the second read-only (client
+ * memory type 0) and writes the job's number back into SUBMIT when the request is long enough to hold it
+ * (struct redwood_mali_submit_ex), so for a buffer this process made itself -- no other process can have
+ * given it a job -- the query needs no call. Imported or shared buffers, and a wait that may still sleep,
+ * go to the kernel as before.
+ */
+#define PANFROST_SUBMIT         0x40
+#define PANFROST_WAIT_BO        0x41
+#define PANFROST_CREATE_BO      0x42
+#define GEM_CLOSE               0x09
+#define MALI_HANDLES            8192            /* RedwoodMali.cpp: MALI_BUFFERS */
+
+static const volatile uint64_t *mali_completed;        /* the kernel's page, or NULL: no fast answers */
+static uint64_t mali_last_job[MALI_HANDLES + 1];       /* a handle's last job; 0: none yet */
+static uint8_t mali_own[MALI_HANDLES + 1];             /* made by this process's CREATE_BO */
+
+struct submit_ex {
+	uint8_t request[48];                    /* drm_panfrost_submit as the kernel has it (jm_ctx_handle, pad) */
+	uint64_t seqno;
+};
+
+static void
+mali_share_open(void)
+{
+	mach_vm_address_t address = 0;
+	mach_vm_size_t size = 0;
+
+	if (IOConnectMapMemory64(connection, 0, mach_task_self(), &address, &size, kIOMapAnywhere | kIOMapReadOnly) == 0 &&
+	    size >= sizeof(uint64_t)) {
+		mali_completed = (const volatile uint64_t *)(uintptr_t)address;
+	}
+}
+
+/* 1: answered (the result in *result, errno set on -1); 0: the kernel must be asked */
+static int
+mali_fast(unsigned number, void *arg, size_t size, int *result)
+{
+	if (mali_completed == NULL) {
+		return 0;
+	}
+	if (number == PANFROST_WAIT_BO && size >= 16) {
+		uint32_t handle = *(const uint32_t *)arg;
+		int64_t deadline = *(const int64_t *)((const char *)arg + 8);
+		uint64_t job;
+
+		if (handle == 0 || handle > MALI_HANDLES || !__atomic_load_n(&mali_own[handle], __ATOMIC_RELAXED)) {
+			return 0;
+		}
+		job = __atomic_load_n(&mali_last_job[handle], __ATOMIC_ACQUIRE);
+		if (job <= __atomic_load_n(mali_completed, __ATOMIC_ACQUIRE)) {
+			*result = 0;
+			return 1;
+		}
+		if (deadline <= os_time_get_nano()) {
+			errno = ETIMEDOUT;      /* busy, and the caller will not wait: what the kernel would say */
+			*result = -1;
+			return 1;
+		}
+		return 0;
+	}
+	return 0;
+}
+
+/* what a request changes in the tables above, once the kernel has answered it */
+static void
+mali_note(unsigned number, const void *arg, size_t size, uint64_t seqno)
+{
+	if (number == PANFROST_CREATE_BO && size >= 12) {
+		uint32_t handle = ((const uint32_t *)arg)[2];
+
+		if (handle != 0 && handle <= MALI_HANDLES) {
+			__atomic_store_n(&mali_last_job[handle], 0, __ATOMIC_RELAXED);
+			__atomic_store_n(&mali_own[handle], 1, __ATOMIC_RELEASE);
+		}
+	} else if (number == PANFROST_SUBMIT && seqno != 0) {
+		const uint32_t *handles = (const uint32_t *)(uintptr_t)*(const uint64_t *)((const char *)arg + 24);
+		uint32_t count = *(const uint32_t *)((const char *)arg + 32);
+
+		for (uint32_t i = 0; handles != NULL && i < count; i++) {
+			if (handles[i] != 0 && handles[i] <= MALI_HANDLES) {
+				__atomic_store_n(&mali_last_job[handles[i]], seqno, __ATOMIC_RELEASE);
+			}
+		}
+	}
+}
+
 int
 drmOpenWithType(const char *name, const char *busid, int type)
 {
@@ -57,6 +149,9 @@ drmOpenWithType(const char *name, const char *busid, int type)
 	IOObjectRelease(service);
 	connection_fd = open("/dev/null", O_RDWR);
 	panfrost = mali;
+	if (mali) {
+		mali_share_open();
+	}
 	return dup(connection_fd);
 }
 
@@ -89,12 +184,40 @@ call(unsigned number, void *data, size_t size)
 int
 drmIoctl(int fd, unsigned long request, void *arg)
 {
-	int error = call((unsigned)(request & 0xff), arg, IOCPARM_LEN(request));
+	unsigned number = (unsigned)(request & 0xff);
+	size_t size = IOCPARM_LEN(request);
+	uint64_t seqno = 0;
+	int error, result;
 
 	(void)fd;
+	if (panfrost) {
+		if (mali_fast(number, arg, size, &result)) {
+			return result;
+		}
+		if (number == GEM_CLOSE && size >= 4) {
+			uint32_t handle = *(const uint32_t *)arg;
+
+			if (handle != 0 && handle <= MALI_HANDLES) {
+				__atomic_store_n(&mali_own[handle], 0, __ATOMIC_RELEASE);
+			}
+		}
+	}
+	if (panfrost && number == PANFROST_SUBMIT && mali_completed != NULL && size <= sizeof(((struct submit_ex *)0)->request)) {
+		struct submit_ex ex;
+
+		memset(&ex, 0, sizeof(ex));
+		memcpy(ex.request, arg, size);
+		error = call(number, &ex, sizeof(ex));
+		seqno = error == 0 ? ex.seqno : 0;
+	} else {
+		error = call(number, arg, size);
+	}
 	if (error != 0) {
 		errno = error;
 		return -1;
+	}
+	if (panfrost) {
+		mali_note(number, arg, size, seqno);
 	}
 	return 0;
 }
@@ -209,12 +332,38 @@ redwood_drm_counts(uint64_t counts[4])
 	return 0;
 }
 
+/*
+ * A buffer object handed to another part of this same process (a texture laid over a buffer's memory,
+ * air_metal.c's rwa_texture_from_buffer): the "file descriptor" is the handle itself with a tag no
+ * IOSurface ID has, and importing it gives the same handle back -- Panfrost then finds its own buffer object
+ * and takes a reference (panfrost_bo_import). Nothing leaves the process this way.
+ */
+#define REDWOOD_PRIME_LOCAL     0x40000000u
+
+int
+drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
+{
+	(void)fd;
+	(void)flags;
+	if (handle == 0 || (handle & REDWOOD_PRIME_LOCAL) != 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	*prime_fd = (int)(handle | REDWOOD_PRIME_LOCAL);
+	return 0;
+}
+
 int
 drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
 {
 	struct redwood_drm_surface request = { .surface = (uint32_t)surface };
-	int error = call(REDWOOD_GPU_SURFACE, &request, sizeof(request));
+	int error;
 
+	if (((uint32_t)surface & REDWOOD_PRIME_LOCAL) != 0) {
+		*handle = (uint32_t)surface & ~REDWOOD_PRIME_LOCAL;
+		return 0;
+	}
+	error = call(REDWOOD_GPU_SURFACE, &request, sizeof(request));
 	(void)fd;
 	if (error != 0) {
 		errno = error;
@@ -231,10 +380,9 @@ none(void)
 	return -1;
 }
 
-/* Buffers and fences as file descriptors, for handing them to other programs and drivers: none of that here. */
+/* Buffers and fences as file descriptors for other programs and drivers: none of that here (drmPrimeHandleToFD
+ * above names a buffer only inside this process). */
 #define NONE(name, ...) int name(__VA_ARGS__) { return none(); }
-NONE(drmPrimeHandleToFD, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle,
-    __attribute__((unused)) uint32_t flags, __attribute__((unused)) int *prime_fd)
 
 /*
  * Syncobjs: the kernel's (RedwoodMali; RedwoodGPU has none). A sync file -- a fence as a file

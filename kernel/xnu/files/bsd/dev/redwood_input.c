@@ -3,6 +3,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <miscfs/devfs/devfs.h>
@@ -113,6 +114,10 @@ count_fingers(uint32_t type, uint32_t finger)
 	}
 }
 
+/* when a finger last came down, and the last touch event of any kind: the clocks' touch boost (redwood_exynos_acpm.c) */
+uint64_t redwood_touch_down_at, redwood_touch_last_at;
+extern int redwood_gov_wake;            /* the clock governor's wake-up (redwood_exynos_acpm.c) */
+
 static void
 touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver)
 {
@@ -139,6 +144,13 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 	}
 	lck_mtx_unlock(&touch_lock);
 	wakeup(&touch_queue);
+	if (type <= REDWOOD_TOUCH_UP) {
+		redwood_touch_last_at = mach_absolute_time();
+		if (type == REDWOOD_TOUCH_DOWN) {
+			redwood_touch_down_at = redwood_touch_last_at;
+			thread_wakeup((event_t)&redwood_gov_wake);
+		}
+	}
 }
 
 void
@@ -214,11 +226,15 @@ static const struct cdevsw touch_cdevsw = {
 
 void redwood_hfs_init(void);
 void redwood_exynos_bt_init(void);
+void redwood_m2m_init(void);
 
 void
 redwood_input_init(void)
 {
-	int major = cdevsw_add(-1, &touch_cdevsw);
+	int major;
+
+	redwood_m2m_init();             /* mali2metal's channel (/dev/m2m) first: the GPU's bring-up below reports into it */
+	major = cdevsw_add(-1, &touch_cdevsw);
 
 	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-touch") == NULL) {
 		printf("redwood-touch: cannot create the device\n");
